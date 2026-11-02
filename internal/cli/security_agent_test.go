@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -18,12 +20,18 @@ import (
 // api/openapi.yaml describes them (tests only).
 type secAgentServer struct {
 	*httptest.Server
-	final apiv1.AgentSessionStatus // status of the session's final snapshot
+	final        apiv1.AgentSessionStatus // status of the session's final snapshot
+	finalSummary string                   // its summary, when not the fixture's
 
 	mu      sync.Mutex
 	queries map[string]string // path -> last raw query
+	pages   []string          // raw query of every events page read
 	lastIDs []string          // Last-Event-ID per event stream connection
 }
+
+// eventPage is how many events the fake answers per page, fewer than any
+// limit a client asks for, so clients must follow nextAfter.
+const eventPage = 2
 
 func fixtureReport() apiv1.SecurityReport {
 	gke := apiv1.SeverityCounts{Total: 1, High: 1}
@@ -94,13 +102,28 @@ func newSecAgentServer(t *testing.T) *secAgentServer {
 			return
 		}
 		if r.URL.Query().Get("format") == "json" {
-			writeJSON(w, 200, apiv1.AgentEventList{Events: fixtureAgentEvents()})
+			s.mu.Lock()
+			s.pages = append(s.pages, r.URL.RawQuery)
+			s.mu.Unlock()
+			after, _ := strconv.ParseInt(r.URL.Query().Get("after"), 10, 64)
+			page := apiv1.AgentEventList{Events: []apiv1.AgentEvent{}}
+			for _, e := range fixtureAgentEvents() {
+				if e.Seq <= after {
+					continue
+				}
+				if len(page.Events) == eventPage {
+					page.NextAfter = ptr(page.Events[eventPage-1].Seq)
+					break
+				}
+				page.Events = append(page.Events, e)
+			}
+			writeJSON(w, 200, page)
 			return
 		}
 		s.mu.Lock()
 		conn := len(s.lastIDs)
 		s.lastIDs = append(s.lastIDs, r.Header.Get("Last-Event-ID"))
-		final := s.final
+		final, finalSummary := s.final, s.finalSummary
 		s.mu.Unlock()
 		w.Header().Set("Content-Type", "text/event-stream")
 		send := func(name string, seq int64, v any) {
@@ -125,7 +148,11 @@ func newSecAgentServer(t *testing.T) *secAgentServer {
 				<-r.Context().Done() // still running
 				return
 			}
-			send("snapshot", 0, fixtureSession(final))
+			last := fixtureSession(final)
+			if finalSummary != "" {
+				last.Summary = ptr(finalSummary)
+			}
+			send("snapshot", 0, last)
 		}
 	})
 	s.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -140,6 +167,12 @@ func newSecAgentServer(t *testing.T) *secAgentServer {
 	}))
 	t.Cleanup(s.Close)
 	return s
+}
+
+func (s *secAgentServer) eventPages() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.pages)
 }
 
 func (s *secAgentServer) query(path string) string {
@@ -219,8 +252,9 @@ func TestAgentListAndShow(t *testing.T) {
 		}
 	}
 	aligned(t, out, "TOOL", "[ok] tool_result", "list_envs")
-	if q := s.query("/v1/agent/sessions/ags_1/events"); q != "format=json" {
-		t.Errorf("events query = %q", q)
+	// The third event is on the second page.
+	if got := fmt.Sprint(s.eventPages()); got != "[format=json&limit=2000 after=2&format=json&limit=2000]" {
+		t.Errorf("event pages read = %s", got)
 	}
 
 	var d struct {
@@ -281,6 +315,15 @@ func TestAgentWatch(t *testing.T) {
 	}
 	if got := strings.Join(names, ","); got != "snapshot:0,tool_call:1,tool_result:2,snapshot:0,blocked:3,snapshot:0" {
 		t.Errorf("--json messages = %s", got)
+	}
+
+	// The platform closes a session nobody writes to; watch ends with it.
+	s = newSecAgentServer(t)
+	s.final, s.finalSummary = apiv1.AgentSessionStatusCancelled, "no activity for 30m; closed by the platform"
+	r = s.harness(t).run("", "agent", "watch", "ags_1")
+	if r.code != ExitRunFailed || !strings.Contains(r.stderr, "agent session ags_1 ended cancelled: no activity for 30m; closed by the platform") ||
+		!strings.Contains(r.stdout, "ended [x] cancelled: no activity for 30m; closed by the platform") {
+		t.Errorf("session closed by the platform: exit %d, %q\n%s", r.code, r.stderr, r.stdout)
 	}
 
 	s = newSecAgentServer(t)

@@ -107,10 +107,10 @@ charlie migrate switch <run id>
 | --- | --- |
 | `security [--environment E] [--severity S] [--refresh]` | 여러 환경의 보안 항목을 환경별로 묶어 심각한 것부터 보여 주고, 소스마다 읽었는지와 이유를 표로 보여 줌 |
 | `agent list [--plan REF] [--run ID] [--limit N]` | AI 에이전트 세션 목록 (최신순, 이벤트 수, 도구 호출 수, 토큰, 소요 시간) |
-| `agent show ID` | 세션 하나와 기록된 이벤트 전부 |
+| `agent show ID` | 세션 하나와 기록된 이벤트 전부. 서버에서 2000개씩 나눠 받음 |
 | `agent watch ID` | 도구 호출과 결과를 실시간으로 한 줄씩 표시. 연결이 끊기면 마지막으로 받은 이벤트 번호부터 다시 받음 |
 
 - `security`의 소스 상태는 `ok`, `unavailable`(응답 없음), `not_configured`(설정이나 자격 증명 없음), `error`(권한 부족 등)입니다. 서버는 결과를 60초 동안 캐시하고, `--refresh`는 다시 읽게 합니다(10초에 한 번까지).
 - `--severity high`는 critical과 high만 보여 줍니다. `--environment`에는 `gke` 같은 환경 이름이나 `aws-account`, `platform`을 씁니다.
-- `agent watch`는 세션이 `succeeded`로 끝나면 0, `failed`나 `cancelled`로 끝나면 3, Ctrl-C로 멈추면 130으로 끝납니다.
+- `agent watch`는 세션이 `succeeded`로 끝나면 0, `failed`나 `cancelled`로 끝나면 3, Ctrl-C로 멈추면 130으로 끝납니다. 에이전트가 이벤트 없이 30분(서버의 `PLATFORM_AGENT_IDLE`) 동안 멈추면 플랫폼이 세션을 `cancelled`로 닫으므로, `watch`도 그 이유(`no activity for 30m; closed by the platform`)를 보여 주고 3으로 끝납니다.
 - `--json`을 붙이면 API 응답을 그대로 출력합니다. `agent show --json`은 `{"session", "events"}`, `agent watch --json`은 메시지마다 `{"event", "id", "data"}` 한 줄입니다.

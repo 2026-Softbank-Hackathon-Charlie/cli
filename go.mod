@@ -17,4 +17,4 @@ require (
 
 // Development only: builds against the combined platform worktree. Remove before merging
 // and require the merged platform commit.
-replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../p-fix-a
+replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../p-sec
