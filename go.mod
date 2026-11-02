@@ -15,6 +15,6 @@ require (
 	github.com/spf13/pflag v1.0.10 // indirect
 )
 
-// Development only: builds against the platform worktree with the plan tools
-// API (feat/plan-tools). Remove before merging and require the merged platform commit.
-replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../p-runs
+// Development only: builds against the combined platform worktree. Remove before merging
+// and require the merged platform commit.
+replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../p-sec
