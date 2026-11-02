@@ -169,6 +169,7 @@ log in to it.`,
 		g.envCmd(), g.planCmd(), g.migrateCmd(),
 		g.trafficCmd(), g.matrixCmd(), g.auditCmd(), g.versionCmd(), g.updateCmd(),
 	)
+	g.addPlanTools(root)
 	return root
 }
 
