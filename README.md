@@ -46,19 +46,26 @@ charlie logout
 | 명령 | 설명 |
 | --- | --- |
 | `env list`, `env show NAME` | 환경과 클러스터 실시간 상태 (노드, 버전, CNPG, 쓰기를 받는 환경) |
+| `apps` | 플랫폼에 등록된 앱과, 앱이 있는 환경 |
+| `plan new --app APP --from ENV --to ENV [--stream NAME] [--submit]` | 등록된 설정으로 엔진 Plan 초안을 만든다. `--submit`이면 바로 제출 |
 | `plan submit -f FILE` | 엔진 Plan 제출 (`-f -`는 표준 입력) |
-| `plan list`, `plan show REF` | Plan 목록과 상세 (상세에는 DB 비밀번호가 전송될 호스트도 표시) |
-| `plan approve REF [--comment]`, `plan reject REF --comment` | 승인, 거절 |
+| `plan attach REF --name NAME -f FILE` | 승인 전 Plan에 파일(대상 CNPG 매니페스트 등)을 붙인다. Plan에서는 `attachment:NAME`으로 가리킨다. 올릴 때마다 Plan의 revision이 1 늘어난다 |
+| `plan list`, `plan show REF` | Plan 목록과 상세 (상세에는 DB 비밀번호가 전송될 호스트, revision, 첨부 이름과 SHA-256도 표시) |
+| `plan approve REF [--comment] [--revision N]`, `plan reject REF --comment` | 승인, 거절. 승인은 아래에 따로 설명 |
+| `written-records STREAM` | 부하 생성기가 보낸 쓰기 성공 기록 수. Plan에서는 `stream:STREAM`으로 가리켜 검증에 쓴다 |
 | `migrate start PLANREF [--watch]` | 이전 시작. 옵션은 아래에 따로 설명 |
 | `migrate list`, `migrate status RUNID` | 실행 목록과 상세 |
 | `migrate watch RUNID` | 단계, 다운타임, 복제 지연, 실패 요청 수, 누락 수를 실시간으로 표시 |
 | `migrate switch RUNID [--watch]` | `awaiting_switch` 상태인 run의 전환 승인 |
 | `migrate abort RUNID [--reason]` | 중단 |
 | `migrate resume RUNID [--watch]` | interrupted, failed, aborted run 재개 |
+| `migrate rollback RUNID [--reason] [--watch]` | 성공한 이전을 반대 방향으로 되돌린다 (operator). run 하나는 한 번만 되돌리고, 앞선 롤백의 시작이 실패했으면 그 Plan을 다시 시작한다 |
 | `traffic [--watch] [--interval 1s]` | 게이트웨이 상태와 환경별 요청 통계 |
 | `matrix` | 6개 경로 결과표 |
 | `audit [--limit N] [--before ID]` | 감사 로그 |
 | `version` | 버전 |
+
+`plan approve`는 Plan을 먼저 읽어 승인할 revision과 첨부(이름, 크기, SHA-256)를 출력하고, 그 revision으로 승인합니다. 그 사이에 첨부가 다시 올라오면 서버가 409로 거부하므로, 출력된 내용과 다른 파일이 승인되는 일은 없습니다. `plan show`로 미리 검토했다면 `--revision N`으로 그 revision을 지정합니다. 그 뒤 Plan이 바뀌었으면 요청을 보내지 않고 `changed since you reviewed it (revision N, now M)`으로 끝납니다. `--json`이면 이 안내는 표준 오류로 나갑니다.
 
 `migrate start` 옵션은 다음과 같습니다.
 
@@ -73,7 +80,8 @@ charlie logout
 
 ```bash
 charlie plan submit -f plan.json                  # agent 또는 operator
-charlie plan approve pln_xxx --comment "확인함"    # operator
+charlie plan show pln_xxx                         # revision과 첨부 확인
+charlie plan approve pln_xxx --revision 2 --comment "확인함"    # operator
 charlie migrate start pln_xxx --canary 10,50 --watch
 # 다른 터미널에서, awaiting_switch가 되면
 charlie migrate switch <run id>
@@ -92,3 +100,17 @@ charlie migrate switch <run id>
 | 130 | Ctrl-C로 중단 |
 
 스크립트에서는 `charlie migrate start ... --watch --auto-switch; echo $?`로 이전 성공 여부를 판단할 수 있습니다.
+
+## 보안 뷰와 에이전트 기록
+
+| 명령 | 설명 |
+| --- | --- |
+| `security [--environment E] [--severity S] [--refresh]` | 여러 환경의 보안 항목을 환경별로 묶어 심각한 것부터 보여 주고, 소스마다 읽었는지와 이유를 표로 보여 줌 |
+| `agent list [--plan REF] [--run ID] [--limit N]` | AI 에이전트 세션 목록 (최신순, 이벤트 수, 도구 호출 수, 토큰, 소요 시간) |
+| `agent show ID` | 세션 하나와 기록된 이벤트 전부. 서버에서 2000개씩 나눠 받음 |
+| `agent watch ID` | 도구 호출과 결과를 실시간으로 한 줄씩 표시. 연결이 끊기면 마지막으로 받은 이벤트 번호부터 다시 받음 |
+
+- `security`의 소스 상태는 `ok`, `unavailable`(응답 없음), `not_configured`(설정이나 자격 증명 없음), `error`(권한 부족 등)입니다. 서버는 결과를 60초 동안 캐시하고, `--refresh`는 다시 읽게 합니다(10초에 한 번까지).
+- `--severity high`는 critical과 high만 보여 줍니다. `--environment`에는 `gke` 같은 환경 이름이나 `aws-account`, `platform`을 씁니다.
+- `agent watch`는 세션이 `succeeded`로 끝나면 0, `failed`나 `cancelled`로 끝나면 3, Ctrl-C로 멈추면 130으로 끝납니다. 에이전트가 이벤트 없이 30분(서버의 `PLATFORM_AGENT_IDLE`) 동안 멈추면 플랫폼이 세션을 `cancelled`로 닫으므로, `watch`도 그 이유(`no activity for 30m; closed by the platform`)를 보여 주고 3으로 끝납니다.
+- `--json`을 붙이면 API 응답을 그대로 출력합니다. `agent show --json`은 `{"session", "events"}`, `agent watch --json`은 메시지마다 `{"event", "id", "data"}` 한 줄입니다.

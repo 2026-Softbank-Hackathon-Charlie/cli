@@ -168,7 +168,9 @@ log in to it.`,
 		g.loginCmd(), g.logoutCmd(), g.whoamiCmd(),
 		g.envCmd(), g.planCmd(), g.migrateCmd(),
 		g.trafficCmd(), g.matrixCmd(), g.auditCmd(), g.versionCmd(), g.updateCmd(),
+		g.securityCmd(), g.agentCmd(),
 	)
+	g.addPlanTools(root)
 	return root
 }
 
