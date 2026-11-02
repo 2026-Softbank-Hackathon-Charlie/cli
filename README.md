@@ -11,11 +11,22 @@ go env -w GOPRIVATE=github.com/2026-Softbank-Hackathon-Charlie
 go install github.com/2026-Softbank-Hackathon-Charlie/cli/cmd/charlie@latest
 ```
 
-직접 빌드할 때는 다음 명령을 씁니다.
+`go install`로 한 번 설치하면 그다음부터는 스스로 업데이트합니다(아래 "자동 업데이트"). 직접 빌드할 때는 다음 명령을 씁니다.
 
 ```bash
 go build -o bin/charlie -ldflags "-X main.version=v0.1.0" ./cmd/charlie
 ```
+
+## 자동 업데이트
+
+`go install`로 설치한 charlie는 스스로 최신 버전을 유지합니다.
+
+- 명령이 끝나면 백그라운드에서 새 버전이 있는지 확인합니다. 확인은 최대 10분에 한 번이고, 명령 출력을 기다리게 하지 않습니다.
+- 새 버전이 있으면 `go install`로 빌드해서 실행 파일을 바꿉니다. 바뀌면 다음 명령을 실행할 때 한 줄로 알려 줍니다.
+- 지금 바로 확인하려면 `charlie update`를 실행합니다.
+- `CHARLIE_UPDATE_INTERVAL`로 확인 주기를 바꿉니다(예: `1h`, `0`이면 매번). `CHARLIE_NO_UPDATE=1`이면 자동 확인을 끕니다.
+- 백그라운드 기록은 `%AppData%\charlie\update.log`(Windows) 또는 `~/.config/charlie/update.log`에 남습니다.
+- `go` 명령이 없거나 `go build`로 직접 만든 개발 빌드는 업데이트하지 않습니다.
 
 ## 로그인
 
