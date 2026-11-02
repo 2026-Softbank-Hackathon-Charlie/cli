@@ -5,8 +5,8 @@ go 1.26.0
 require (
 	github.com/2026-Softbank-Hackathon-Charlie/platform v0.0.0
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/sys v0.47.0
-	golang.org/x/term v0.45.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/term v0.46.0
 )
 
 require (
@@ -17,4 +17,4 @@ require (
 // Development only: builds against the platform-client worktree (pkg/client is
 // not merged yet). Removed once the platform PR is merged; then require a
 // released platform version instead.
-replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../wt/platform-client
+replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../platform

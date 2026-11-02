@@ -100,7 +100,7 @@ func renderEnv(e *apiv1.Environment) string {
 		{"Display name", e.DisplayName},
 		{"Provider", string(e.Provider)},
 		{"Region", str(e.Region)},
-		{"Kube context", str(e.KubeContext)},
+		{"Kube context", e.KubeContext},
 		{"Gateway backend", e.GatewayBackend},
 		{"Receives writes", writes},
 		{"Status", reachable(st) + ", checked " + stamp(st.CheckedAt)},
