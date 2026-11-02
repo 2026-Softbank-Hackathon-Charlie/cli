@@ -1,5 +1,9 @@
 name: ci
 
+# Target: a PR is checked in under a minute. PRs reuse the Go module and build
+# cache that main saves, recompile only what changed, and rerun only the tests
+# whose inputs changed (go test's own result cache).
+
 on:
   pull_request:
   push:
@@ -33,10 +37,6 @@ jobs:
           fi
           git config --global url."https://x-access-token:${TOKEN}@github.com/2026-Softbank-Hackathon-Charlie/".insteadOf "https://github.com/2026-Softbank-Hackathon-Charlie/"
 
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-
       - name: go.mod has no local replace
         run: |
           if grep -n '^replace .* => \.' go.mod; then
@@ -44,10 +44,24 @@ jobs:
             exit 1
           fi
 
-      - name: Build and vet
-        run: |
-          go build ./...
-          go vet ./...
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false # restored below from main's cache instead
+
+      - name: Restore Go cache from main
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
+          restore-keys: |
+            go-${{ runner.os }}-${{ hashFiles('go.sum') }}-
+            go-${{ runner.os }}-
+
+      - name: Vet
+        run: go vet ./...
 
       - name: Formatting
         run: |
@@ -56,5 +70,16 @@ jobs:
             echo "::error::gofmt needed:"; echo "$unformatted"; exit 1
           fi
 
+      # No -count=1: unchanged packages reuse their cached result.
       - name: Test (race)
-        run: go test -race -count=1 ./...
+        run: go test -race ./...
+
+      # Only main saves, so a PR spends no time uploading.
+      - name: Save Go cache
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}-${{ github.sha }}
