@@ -49,9 +49,9 @@ charlie logout
 | `apps` | 플랫폼에 등록된 앱과, 앱이 있는 환경 |
 | `plan new --app APP --from ENV --to ENV [--stream NAME] [--submit]` | 등록된 설정으로 엔진 Plan 초안을 만든다. `--submit`이면 바로 제출 |
 | `plan submit -f FILE` | 엔진 Plan 제출 (`-f -`는 표준 입력) |
-| `plan attach REF --name NAME -f FILE` | 승인 전 Plan에 파일(대상 CNPG 매니페스트 등)을 붙인다. Plan에서는 `attachment:NAME`으로 가리킨다 |
-| `plan list`, `plan show REF` | Plan 목록과 상세 (상세에는 DB 비밀번호가 전송될 호스트도 표시) |
-| `plan approve REF [--comment]`, `plan reject REF --comment` | 승인, 거절 |
+| `plan attach REF --name NAME -f FILE` | 승인 전 Plan에 파일(대상 CNPG 매니페스트 등)을 붙인다. Plan에서는 `attachment:NAME`으로 가리킨다. 올릴 때마다 Plan의 revision이 1 늘어난다 |
+| `plan list`, `plan show REF` | Plan 목록과 상세 (상세에는 DB 비밀번호가 전송될 호스트, revision, 첨부 이름과 SHA-256도 표시) |
+| `plan approve REF [--comment] [--revision N]`, `plan reject REF --comment` | 승인, 거절. 승인은 아래에 따로 설명 |
 | `written-records STREAM` | 부하 생성기가 보낸 쓰기 성공 기록 수. Plan에서는 `stream:STREAM`으로 가리켜 검증에 쓴다 |
 | `migrate start PLANREF [--watch]` | 이전 시작. 옵션은 아래에 따로 설명 |
 | `migrate list`, `migrate status RUNID` | 실행 목록과 상세 |
@@ -59,11 +59,13 @@ charlie logout
 | `migrate switch RUNID [--watch]` | `awaiting_switch` 상태인 run의 전환 승인 |
 | `migrate abort RUNID [--reason]` | 중단 |
 | `migrate resume RUNID [--watch]` | interrupted, failed, aborted run 재개 |
-| `migrate rollback RUNID [--reason] [--watch]` | 성공한 이전을 반대 방향으로 되돌린다 (operator) |
+| `migrate rollback RUNID [--reason] [--watch]` | 성공한 이전을 반대 방향으로 되돌린다 (operator). run 하나는 한 번만 되돌리고, 앞선 롤백의 시작이 실패했으면 그 Plan을 다시 시작한다 |
 | `traffic [--watch] [--interval 1s]` | 게이트웨이 상태와 환경별 요청 통계 |
 | `matrix` | 6개 경로 결과표 |
 | `audit [--limit N] [--before ID]` | 감사 로그 |
 | `version` | 버전 |
+
+`plan approve`는 Plan을 먼저 읽어 승인할 revision과 첨부(이름, 크기, SHA-256)를 출력하고, 그 revision으로 승인합니다. 그 사이에 첨부가 다시 올라오면 서버가 409로 거부하므로, 출력된 내용과 다른 파일이 승인되는 일은 없습니다. `plan show`로 미리 검토했다면 `--revision N`으로 그 revision을 지정합니다. 그 뒤 Plan이 바뀌었으면 요청을 보내지 않고 `changed since you reviewed it (revision N, now M)`으로 끝납니다. `--json`이면 이 안내는 표준 오류로 나갑니다.
 
 `migrate start` 옵션은 다음과 같습니다.
 
@@ -78,7 +80,8 @@ charlie logout
 
 ```bash
 charlie plan submit -f plan.json                  # agent 또는 operator
-charlie plan approve pln_xxx --comment "확인함"    # operator
+charlie plan show pln_xxx                         # revision과 첨부 확인
+charlie plan approve pln_xxx --revision 2 --comment "확인함"    # operator
 charlie migrate start pln_xxx --canary 10,50 --watch
 # 다른 터미널에서, awaiting_switch가 되면
 charlie migrate switch <run id>

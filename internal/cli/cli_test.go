@@ -359,7 +359,7 @@ func TestPlanCommands(t *testing.T) {
 	}
 
 	r = h.run("", "plan", "approve", "pln_2", "--comment", "ok to go").ok(t)
-	if got := string(f.last(t, "POST", "/v1/plans/pln_2/approve").body); got != `{"comment":"ok to go"}` {
+	if got := string(f.last(t, "POST", "/v1/plans/pln_2/approve").body); got != `{"comment":"ok to go","revision":2}` {
 		t.Errorf("approve body %s", got)
 	}
 	if !strings.Contains(r.stdout, "charlie migrate start pln_2") {

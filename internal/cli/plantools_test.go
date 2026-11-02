@@ -264,3 +264,50 @@ func decodeOut[T any](t *testing.T, s string) T {
 	}
 	return v
 }
+
+// The approver approves the revision and attachments the CLI printed, and
+// nothing uploaded after that.
+func TestPlanApproveSendsTheReviewedRevision(t *testing.T) {
+	f := newFake(t, "tok")
+	h := loggedIn(t, f)
+	sha := fixturePendingWithAttachment().Attachments
+	want := (*sha)[0].Sha256
+
+	out := h.run("", "plan", "show", "pln_2").ok(t).stdout
+	for _, s := range []string{"Revision:", "2", "target.yaml", "2.0 KiB", want} {
+		if !strings.Contains(out, s) {
+			t.Errorf("show lacks %q:\n%s", s, out)
+		}
+	}
+
+	out = h.run("", "plan", "approve", "pln_2").ok(t).stdout
+	if !strings.Contains(out, "Approving plan pln_2 at revision 2 with these attachments:") || !strings.Contains(out, "target.yaml") || !strings.Contains(out, want) {
+		t.Errorf("approve output:\n%s", out)
+	}
+	if got := string(f.last(t, "POST", "/v1/plans/pln_2/approve").body); got != `{"revision":2}` {
+		t.Errorf("approve body %s", got)
+	}
+
+	// --revision pins what the operator reviewed earlier.
+	h.run("", "plan", "approve", "pln_2", "--revision", "2").ok(t)
+	before := len(f.requests())
+	r := h.run("", "plan", "approve", "pln_2", "--revision", "1")
+	if r.code != ExitError || !strings.Contains(r.stderr, "changed since you reviewed it (revision 1, now 2)") {
+		t.Errorf("stale --revision: exit %d, stderr %q", r.code, r.stderr)
+	}
+	for _, req := range f.requests()[before:] {
+		if req.method == "POST" {
+			t.Errorf("a stale --revision still sent %s %s", req.method, req.path)
+		}
+	}
+	if r := h.run("", "plan", "approve", "pln_2", "--revision", "0"); r.code != ExitUsage {
+		t.Errorf("--revision 0: exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	// With --json, stdout is the approved plan alone.
+	r = h.run("", "--json", "plan", "approve", "pln_2").ok(t)
+	var rec apiv1.PlanRecord
+	if err := json.Unmarshal([]byte(r.stdout), &rec); err != nil || rec.Ref != "pln_2" || !strings.Contains(r.stderr, "Approving plan pln_2 at revision 2 with") {
+		t.Errorf("json approve: %v\nstdout %s\nstderr %s", err, r.stdout, r.stderr)
+	}
+}

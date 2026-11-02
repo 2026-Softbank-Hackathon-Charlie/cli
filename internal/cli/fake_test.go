@@ -67,11 +67,14 @@ func newFake(t *testing.T, token string) *fakeServer {
 			fixturePlan("pln_2", apiv1.PlanStatusPendingApproval), fixturePlan("pln_1", apiv1.PlanStatusStarted)}})
 	})
 	mux.HandleFunc("GET /v1/plans/{ref}", func(w http.ResponseWriter, r *http.Request) {
-		if r.PathValue("ref") != "pln_1" {
+		switch r.PathValue("ref") {
+		case "pln_1":
+			writeJSON(w, 200, fixturePlan("pln_1", apiv1.PlanStatusStarted))
+		case "pln_2":
+			writeJSON(w, 200, fixturePendingWithAttachment())
+		default:
 			writeError(w, 404, "plan_not_found", "plan not found")
-			return
 		}
-		writeJSON(w, 200, fixturePlan("pln_1", apiv1.PlanStatusStarted))
 	})
 	mux.HandleFunc("POST /v1/plans/{ref}/approve", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("ref") == "pln_1" {
@@ -222,8 +225,16 @@ func fixtureEnvs() apiv1.EnvironmentList {
 	}}
 }
 
+// fixturePendingWithAttachment is pln_2 after one manifest upload.
+func fixturePendingWithAttachment() apiv1.PlanRecord {
+	p := fixturePlan("pln_2", apiv1.PlanStatusPendingApproval)
+	p.Revision = 2
+	p.Attachments = &[]apiv1.PlanAttachment{{Name: "target.yaml", Size: 2048, Sha256: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}}
+	return p
+}
+
 func fixturePlan(ref string, status apiv1.PlanStatus) apiv1.PlanRecord {
-	p := apiv1.PlanRecord{Ref: ref, Status: status, SubmittedBy: "planner", SubmittedAt: t0,
+	p := apiv1.PlanRecord{Ref: ref, Status: status, Revision: 1, SubmittedBy: "planner", SubmittedAt: t0,
 		Summary: apiv1.PlanSummary{PlanId: "shop-gke-eks", Files: true, GatewayMode: "http", FenceGate: true, MaxDowntime: "3m",
 			Source: apiv1.PlanEndpoint{Env: "gke", Namespace: "shop", Cluster: "pg", DbHost: ptr("10.0.1.5:5432")},
 			Target: apiv1.PlanEndpoint{Env: "eks", Namespace: "shop", Cluster: "pg", DbHost: ptr("pg.eks.example.com:5432")}}}
