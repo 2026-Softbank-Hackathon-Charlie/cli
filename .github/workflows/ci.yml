@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      GOPRIVATE: github.com/2026-Softbank-Hackathon-Charlie
+    steps:
+      - uses: actions/checkout@v5
+
+      # platform and migration-engine are private modules. MODULE_READ_TOKEN is
+      # a repository secret: a fine-grained token with Contents read on both.
+      - name: Private modules
+        env:
+          TOKEN: ${{ secrets.MODULE_READ_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::Repository secret MODULE_READ_TOKEN is not set (read access to platform and migration-engine)."
+            exit 1
+          fi
+          git config --global url."https://x-access-token:${TOKEN}@github.com/2026-Softbank-Hackathon-Charlie/".insteadOf "https://github.com/2026-Softbank-Hackathon-Charlie/"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: go.mod has no local replace
+        run: |
+          if grep -n '^replace .* => \.' go.mod; then
+            echo "::error::go.mod points at a local checkout; require a pushed platform commit instead."
+            exit 1
+          fi
+
+      - name: Build and vet
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Test (race)
+        run: go test -race -count=1 ./...
