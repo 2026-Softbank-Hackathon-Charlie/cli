@@ -30,6 +30,10 @@ const (
 	kindStatusChanged = "status_changed"
 	kindCanaryStep    = "canary_step"
 	kindGateResult    = "gate_result"
+	// After the cutover (Run.observe): one per gate evaluation, and the
+	// automatic rollback it started, if any.
+	kindObserveStep     = "observe_step"
+	kindObserveRollback = "observe_rollback"
 )
 
 func switchHint(runID string) string {
@@ -53,9 +57,11 @@ type runView struct {
 	// came from the latest snapshot; the current attempt starts at attempt.
 	canary            []apiv1.CanaryStep
 	snapRows, attempt int
-	lag               *int64
-	lagAt             time.Time
-	recent            []string
+	// observe holds the observe steps: the latest snapshot's, then live ones.
+	observe []apiv1.ObserveStep
+	lag     *int64
+	lagAt   time.Time
+	recent  []string
 }
 
 func newRunView() *runView { return &runView{steps: map[string]apiv1.StepRecord{}} }
@@ -84,6 +90,10 @@ func (v *runView) snapshot(r *apiv1.Run) {
 		rows = append(rows, r.Canary.Steps...)
 	}
 	v.canary, v.snapRows, v.attempt = rows, len(rows), 0
+	v.observe = nil
+	if r.Observe != nil {
+		v.observe = append(v.observe, r.Observe.Steps...)
+	}
 	// A reconnect snapshot lacks the step being measured, and its
 	// canary_step is not replayed.
 	if open != nil && v.measuring() && v.row(open.Weight) < 0 {
@@ -228,7 +238,45 @@ func (v *runView) liveEvent(e *apiv1.RunEvent, data map[string]any) {
 		if v.canary[i].EndedAt == nil {
 			v.canary[i].EndedAt = &at
 		}
+	case kindObserveStep:
+		var gate apiv1.GateResult
+		verdict, _ := data["verdict"].(string)
+		st := apiv1.ObserveStep{StartedAt: at, EndedAt: &at, Verdict: apiv1.ObserveStepVerdict(verdict)}
+		if decodeAs(data["gate"], &gate) {
+			st.Gate = &gate
+		}
+		obs := v.observeResult()
+		if d := obs.Options.StepDuration; d != nil {
+			if step, err := time.ParseDuration(*d); err == nil {
+				st.StartedAt = at.Add(-step)
+			}
+		}
+		v.observe = append(v.observe, st)
+		if st.Verdict == apiv1.ObserveStepVerdictViolated {
+			f, reason := false, ""
+			if st.Gate != nil {
+				reason = st.Gate.Reason
+			}
+			obs.Passed, obs.Violation = &f, &reason
+		}
+	case kindObserveRollback:
+		obs := v.observeResult()
+		if id, ok := data["rollbackRunId"].(string); ok && id != "" {
+			obs.RollbackRunId = &id
+		}
+		if e, ok := data["error"].(string); ok && e != "" {
+			obs.RollbackError = &e
+		}
 	}
+}
+
+// observeResult is the run's observe result, made when only events have
+// told about it so far.
+func (v *runView) observeResult() *apiv1.ObserveResult {
+	if v.run.Observe == nil {
+		v.run.Observe = &apiv1.ObserveResult{Steps: []apiv1.ObserveStep{}}
+	}
+	return v.run.Observe
 }
 
 // num reads a JSON number from event data.
@@ -362,9 +410,34 @@ func (v *runView) frame(now time.Time, width, maxLines int) string {
 		b.WriteString(table(rows))
 	}
 
+	if r.Observe != nil || len(v.observe) > 0 {
+		b.WriteString("\n")
+		if r.Observe != nil {
+			fmt.Fprintf(&b, "Observe %s\n", observePlan(r.Observe))
+		}
+		rows := [][]string{{"OBSERVE", "STARTED", "ENDED", "GATE"}}
+		for i, s := range v.observe {
+			ended := ""
+			if s.EndedAt != nil {
+				ended = clock(*s.EndedAt)
+			}
+			rows = append(rows, []string{fmt.Sprint(i + 1), clock(s.StartedAt), ended, observeText(s)})
+		}
+		if len(v.observe) > 0 {
+			b.WriteString(table(rows))
+		} else if r.Phase == apiv1.RunPhaseObserve {
+			b.WriteString("[..] first observe step running\n")
+		}
+	}
+
 	tail := ""
-	if r.Status == apiv1.RunStatusAwaitingSwitch {
+	switch {
+	case r.Status == apiv1.RunStatusAwaitingSwitch:
 		tail = "\n" + switchHint(r.RunId) + "\n"
+	case r.Observe != nil && r.Observe.RollbackRunId != nil:
+		tail = fmt.Sprintf("\nautomatic rollback started; follow it with \"charlie migrate watch %s\"\n", *r.Observe.RollbackRunId)
+	case r.Observe != nil && r.Observe.Passed != nil && !*r.Observe.Passed && r.Status == apiv1.RunStatusSucceeded:
+		tail = fmt.Sprintf("\nthe target broke the gate after cutover; roll back with \"charlie migrate rollback %s\"\n", r.RunId)
 	}
 	recent := v.recent
 	if maxLines > 0 {
@@ -388,21 +461,7 @@ func canaryPlan(c *apiv1.CanaryResult) string {
 	if o.StepDuration != nil {
 		s += ", " + *o.StepDuration + " per step"
 	}
-	if gt := o.Gate; gt != nil {
-		var parts []string
-		if gt.MaxErrorRate != nil {
-			parts = append(parts, "error rate <= "+percent(*gt.MaxErrorRate))
-		}
-		if gt.MaxP95Millis != nil {
-			parts = append(parts, fmt.Sprintf("p95 <= %dms", *gt.MaxP95Millis))
-		}
-		if gt.MinRequests != nil {
-			parts = append(parts, fmt.Sprintf("at least %d requests", *gt.MinRequests))
-		}
-		if len(parts) > 0 {
-			s += "; gate " + strings.Join(parts, ", ")
-		}
-	}
+	s += gatePlan(o.Gate)
 	if c.Passed != nil {
 		if *c.Passed {
 			s += "; [ok] passed"
@@ -411,6 +470,75 @@ func canaryPlan(c *apiv1.CanaryResult) string {
 		}
 	}
 	return s
+}
+
+// gatePlan describes gate thresholds, or nothing when the server's defaults apply.
+func gatePlan(gt *apiv1.GateThresholds) string {
+	if gt == nil {
+		return ""
+	}
+	var parts []string
+	if gt.MaxErrorRate != nil {
+		parts = append(parts, "error rate <= "+percent(*gt.MaxErrorRate))
+	}
+	if gt.MaxP95Millis != nil {
+		parts = append(parts, fmt.Sprintf("p95 <= %dms", *gt.MaxP95Millis))
+	}
+	if gt.MinRequests != nil {
+		parts = append(parts, fmt.Sprintf("at least %d requests", *gt.MinRequests))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "; gate " + strings.Join(parts, ", ")
+}
+
+// observePlan is the observe options and outcome on one line.
+func observePlan(o *apiv1.ObserveResult) string {
+	opts := o.Options
+	s := "after cutover"
+	if opts.Duration != nil {
+		s = *opts.Duration + " " + s
+	}
+	if opts.StepDuration != nil {
+		s += ", " + *opts.StepDuration + " per step"
+	}
+	s += gatePlan(opts.Gate)
+	if opts.AutoRollback != nil && *opts.AutoRollback {
+		s += "; automatic rollback on"
+	}
+	switch {
+	case o.Passed != nil && *o.Passed:
+		s += "; [ok] passed"
+	case o.Passed != nil:
+		s += "; [x] violated: " + str(o.Violation)
+	case o.StoppedReason != nil:
+		s += "; stopped: " + *o.StoppedReason
+	}
+	if o.RollbackRunId != nil {
+		s += "; rollback run " + *o.RollbackRunId
+	}
+	if o.RollbackError != nil {
+		s += "; rollback could not start: " + *o.RollbackError
+	}
+	return s
+}
+
+// observeText is one observe step's gate verdict.
+func observeText(s apiv1.ObserveStep) string {
+	if s.Gate == nil {
+		return string(s.Verdict)
+	}
+	gt := s.Gate
+	nums := fmt.Sprintf("%d requests, %s errors, p95 %s", gt.Requests, percent(gt.ErrorRate),
+		human(time.Duration(float64(gt.P95Millis)*float64(time.Millisecond))))
+	switch s.Verdict {
+	case apiv1.ObserveStepVerdictOk:
+		return "[ok] passed, " + nums
+	case apiv1.ObserveStepVerdictInconclusive:
+		return "[..] inconclusive (" + gt.Reason + "), " + nums
+	}
+	return "[x] " + gt.Reason + ", " + nums
 }
 
 func gateText(s apiv1.CanaryStep) string {
