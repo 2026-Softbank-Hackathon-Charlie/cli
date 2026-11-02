@@ -46,15 +46,20 @@ charlie logout
 | 명령 | 설명 |
 | --- | --- |
 | `env list`, `env show NAME` | 환경과 클러스터 실시간 상태 (노드, 버전, CNPG, 쓰기를 받는 환경) |
+| `apps` | 플랫폼에 등록된 앱과, 앱이 있는 환경 |
+| `plan new --app APP --from ENV --to ENV [--stream NAME] [--submit]` | 등록된 설정으로 엔진 Plan 초안을 만든다. `--submit`이면 바로 제출 |
 | `plan submit -f FILE` | 엔진 Plan 제출 (`-f -`는 표준 입력) |
+| `plan attach REF --name NAME -f FILE` | 승인 전 Plan에 파일(대상 CNPG 매니페스트 등)을 붙인다. Plan에서는 `attachment:NAME`으로 가리킨다 |
 | `plan list`, `plan show REF` | Plan 목록과 상세 (상세에는 DB 비밀번호가 전송될 호스트도 표시) |
 | `plan approve REF [--comment]`, `plan reject REF --comment` | 승인, 거절 |
+| `written-records STREAM` | 부하 생성기가 보낸 쓰기 성공 기록 수. Plan에서는 `stream:STREAM`으로 가리켜 검증에 쓴다 |
 | `migrate start PLANREF [--watch]` | 이전 시작. 옵션은 아래에 따로 설명 |
 | `migrate list`, `migrate status RUNID` | 실행 목록과 상세 |
 | `migrate watch RUNID` | 단계, 다운타임, 복제 지연, 실패 요청 수, 누락 수를 실시간으로 표시 |
 | `migrate switch RUNID [--watch]` | `awaiting_switch` 상태인 run의 전환 승인 |
 | `migrate abort RUNID [--reason]` | 중단 |
 | `migrate resume RUNID [--watch]` | interrupted, failed, aborted run 재개 |
+| `migrate rollback RUNID [--reason] [--watch]` | 성공한 이전을 반대 방향으로 되돌린다 (operator) |
 | `traffic [--watch] [--interval 1s]` | 게이트웨이 상태와 환경별 요청 통계 |
 | `matrix` | 6개 경로 결과표 |
 | `audit [--limit N] [--before ID]` | 감사 로그 |
