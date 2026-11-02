@@ -1,9 +1,14 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
+	"time"
 
+	"github.com/2026-Softbank-Hackathon-Charlie/cli/internal/update"
 	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/apiv1"
 	"github.com/spf13/cobra"
 )
@@ -106,4 +111,49 @@ func (g *globals) versionCmd() *cobra.Command {
 			return p.text("charlie " + g.app.Version + "\n")
 		},
 	}
+}
+
+func (g *globals) updateCmd() *cobra.Command {
+	var background bool
+	c := &cobra.Command{
+		Use:   "update",
+		Short: "Install the newest charlie now",
+		Long: `charlie updates itself in the background after a command ends, at most
+once every 10 minutes (CHARLIE_UPDATE_INTERVAL changes it, CHARLIE_NO_UPDATE=1
+turns it off). This command does the same check now and waits for it.
+
+Updating needs the go command and access to the private repositories
+(GOPRIVATE=github.com/2026-Softbank-Hackathon-Charlie, git credentials for GitHub).`,
+		Args: noArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if g.app.Updater == nil {
+				return errors.New("updates are not available in this build")
+			}
+			cfg := *g.app.Updater
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Minute)
+			defer cancel()
+			out := cmd.OutOrStdout()
+			if background {
+				// Started by MaybeStart with stdout going to update.log.
+				fmt.Fprintf(out, "%s background update\n", time.Now().Format(time.RFC3339))
+				_, err := update.Update(ctx, cfg, out)
+				if err != nil && !errors.Is(err, update.ErrBusy) {
+					fmt.Fprintf(out, "update failed: %v\n", err)
+				}
+				return nil
+			}
+			res, err := update.Update(ctx, cfg, io.Discard)
+			if err != nil {
+				return err
+			}
+			if !res.Updated {
+				return g.out().text(fmt.Sprintf("charlie %s is up to date\n", res.From))
+			}
+			_ = update.TakeNotice(cfg) // reported here; do not repeat it on the next command
+			return g.out().text(fmt.Sprintf("Updated charlie from %s to %s.\n", res.From, res.To))
+		},
+	}
+	c.Flags().BoolVar(&background, "background", false, "run quietly and log to update.log (used by the automatic update)")
+	_ = c.Flags().MarkHidden("background")
+	return c
 }
