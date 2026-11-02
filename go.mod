@@ -3,7 +3,7 @@ module github.com/2026-Softbank-Hackathon-Charlie/cli
 go 1.26.0
 
 require (
-	github.com/2026-Softbank-Hackathon-Charlie/platform v0.0.0-20261102052121-0a449307db7d
+	github.com/2026-Softbank-Hackathon-Charlie/platform v0.0.0-20261102092707-9d5fbbb07a48
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/mod v0.42.0
 	golang.org/x/sys v0.48.0

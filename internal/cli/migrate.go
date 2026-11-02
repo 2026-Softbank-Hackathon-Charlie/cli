@@ -24,6 +24,9 @@ func (g *globals) migrateStartCmd() *cobra.Command {
 		step           time.Duration
 		maxErr         float64
 		maxP95, minReq int
+		observe        time.Duration
+		observeStep    time.Duration
+		autoRollback   bool
 		key            string
 		watch          bool
 	)
@@ -33,6 +36,8 @@ func (g *globals) migrateStartCmd() *cobra.Command {
 		Long: `Starts an approved plan and prints the run id. The run syncs data, can send a
 share of read traffic to the target first (--canary), and then waits in
 awaiting_switch for "charlie migrate switch" unless --auto-switch is given.
+With --observe it keeps watching the target against the same gate after the
+cutover; --auto-rollback then starts the rollback by itself on a breach.
 
 An idempotency key is generated unless --idempotency-key is given. Pass the
 printed key again to retry without starting a second run.`,
@@ -42,11 +47,11 @@ printed key again to retry without starting a second run.`,
 			if cmd.Flags().Changed("auto-switch") {
 				req.AutoSwitch = &autoSwitch
 			}
-			canary, err := canaryOptions(cmd, weights, step, maxErr, maxP95, minReq)
+			canary, obs, err := runOptions(cmd, runFlags{weights, step, observe, observeStep, autoRollback, maxErr, maxP95, minReq})
 			if err != nil {
 				return err
 			}
-			req.Canary = canary
+			req.Canary, req.Observe = canary, obs
 			if key == "" {
 				key = "charlie-" + rand.Text()
 			}
@@ -85,57 +90,108 @@ printed key again to retry without starting a second run.`,
 	f.BoolVar(&autoSwitch, "auto-switch", false, "cut over as soon as data is in sync, without waiting for switch")
 	f.IntSliceVar(&weights, "canary", nil, "shares of read traffic to send to the target before cutover, e.g. 10,50")
 	f.DurationVar(&step, "canary-step", 20*time.Second, "length of each canary step")
-	f.Float64Var(&maxErr, "max-error-rate", 0.01, "canary gate: highest error rate on the target")
-	f.IntVar(&maxP95, "max-p95", 800, "canary gate: highest p95 latency on the target, in milliseconds")
-	f.IntVar(&minReq, "min-requests", 20, "canary gate: fewest target requests per step")
+	f.DurationVar(&observe, "observe", 0, "after cutover, check the target against the gate this long before the run ends, e.g. 2m")
+	f.DurationVar(&observeStep, "observe-step", 20*time.Second, "length of each observe step")
+	f.BoolVar(&autoRollback, "auto-rollback", false, "with --observe, start the rollback by itself when the target breaks the gate")
+	f.Float64Var(&maxErr, "max-error-rate", 0.01, "gate (canary and observe): highest error rate on the target")
+	f.IntVar(&maxP95, "max-p95", 800, "gate (canary and observe): highest p95 latency on the target, in milliseconds")
+	f.IntVar(&minReq, "min-requests", 20, "gate (canary and observe): fewest target requests per step")
 	f.StringVar(&key, "idempotency-key", "", "key that makes a retry return the original run")
 	f.BoolVar(&watch, "watch", false, "watch the run after starting it")
 	return cmd
 }
 
-// canaryOptions sends only what the user set, so the server's defaults apply
-// to the rest.
-func canaryOptions(cmd *cobra.Command, weights []int, step time.Duration, maxErr float64, maxP95, minReq int) (*apiv1.CanaryOptions, error) {
+// runFlags are the "migrate start" flags that shape the canary and the observe phase.
+type runFlags struct {
+	weights        []int
+	step           time.Duration
+	observe        time.Duration
+	observeStep    time.Duration
+	autoRollback   bool
+	maxErr         float64
+	maxP95, minReq int
+}
+
+// runOptions builds the canary and observe options. Both use the same gate
+// flags. Only what the user set is sent, so the server's defaults apply to
+// the rest.
+func runOptions(cmd *cobra.Command, fl runFlags) (*apiv1.CanaryOptions, *apiv1.ObserveOptions, error) {
 	f := cmd.Flags()
-	if !f.Changed("canary") {
-		for _, n := range []string{"canary-step", "max-error-rate", "max-p95", "min-requests"} {
+	canaryOn, observeOn := f.Changed("canary"), f.Changed("observe")
+	if !canaryOn && f.Changed("canary-step") {
+		return nil, nil, usagef(cmd, "--canary-step needs --canary")
+	}
+	if !observeOn {
+		for _, n := range []string{"observe-step", "auto-rollback"} {
 			if f.Changed(n) {
-				return nil, usagef(cmd, "--%s needs --canary", n)
+				return nil, nil, usagef(cmd, "--%s needs --observe", n)
 			}
 		}
-		return nil, nil
 	}
-	if len(weights) == 0 {
-		return nil, usagef(cmd, "--canary needs at least one weight, e.g. --canary 10,50")
-	}
-	for _, w := range weights {
-		if w < 1 || w > 100 {
-			return nil, usagef(cmd, "--canary weights must be between 1 and 100, got %d", w)
+	if !canaryOn && !observeOn {
+		for _, n := range []string{"max-error-rate", "max-p95", "min-requests"} {
+			if f.Changed(n) {
+				return nil, nil, usagef(cmd, "--%s needs --canary or --observe", n)
+			}
 		}
+		return nil, nil, nil
 	}
-	o := &apiv1.CanaryOptions{Weights: weights}
-	if f.Changed("canary-step") {
-		if step <= 0 {
-			return nil, usagef(cmd, "--canary-step must be positive")
-		}
-		s := step.String()
-		o.StepDuration = &s
-	}
-	var gate apiv1.GateThresholds
+
+	var gate *apiv1.GateThresholds
+	var g apiv1.GateThresholds
 	if f.Changed("max-error-rate") {
-		v := float32(maxErr)
-		gate.MaxErrorRate = &v
+		v := float32(fl.maxErr)
+		g.MaxErrorRate = &v
 	}
 	if f.Changed("max-p95") {
-		gate.MaxP95Millis = &maxP95
+		g.MaxP95Millis = &fl.maxP95
 	}
 	if f.Changed("min-requests") {
-		gate.MinRequests = &minReq
+		g.MinRequests = &fl.minReq
 	}
-	if gate != (apiv1.GateThresholds{}) {
-		o.Gate = &gate
+	if g != (apiv1.GateThresholds{}) {
+		gate = &g
 	}
-	return o, nil
+
+	var c *apiv1.CanaryOptions
+	if canaryOn {
+		if len(fl.weights) == 0 {
+			return nil, nil, usagef(cmd, "--canary needs at least one weight, e.g. --canary 10,50")
+		}
+		for _, w := range fl.weights {
+			if w < 1 || w > 100 {
+				return nil, nil, usagef(cmd, "--canary weights must be between 1 and 100, got %d", w)
+			}
+		}
+		c = &apiv1.CanaryOptions{Weights: fl.weights, Gate: gate}
+		if f.Changed("canary-step") {
+			if fl.step <= 0 {
+				return nil, nil, usagef(cmd, "--canary-step must be positive")
+			}
+			s := fl.step.String()
+			c.StepDuration = &s
+		}
+	}
+
+	var o *apiv1.ObserveOptions
+	if observeOn {
+		if fl.observe <= 0 {
+			return nil, nil, usagef(cmd, "--observe must be positive, e.g. --observe 2m")
+		}
+		d := fl.observe.String()
+		o = &apiv1.ObserveOptions{Duration: &d, Gate: gate}
+		if f.Changed("observe-step") {
+			if fl.observeStep <= 0 {
+				return nil, nil, usagef(cmd, "--observe-step must be positive")
+			}
+			s := fl.observeStep.String()
+			o.StepDuration = &s
+		}
+		if f.Changed("auto-rollback") {
+			o.AutoRollback = &fl.autoRollback
+		}
+	}
+	return c, o, nil
 }
 
 func (g *globals) migrateListCmd() *cobra.Command {

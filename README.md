@@ -55,7 +55,7 @@ charlie logout
 | `written-records STREAM` | 부하 생성기가 보낸 쓰기 성공 기록 수. Plan에서는 `stream:STREAM`으로 가리켜 검증에 쓴다 |
 | `migrate start PLANREF [--watch]` | 이전 시작. 옵션은 아래에 따로 설명 |
 | `migrate list`, `migrate status RUNID` | 실행 목록과 상세 |
-| `migrate watch RUNID` | 단계, 다운타임, 복제 지연, 실패 요청 수, 누락 수를 실시간으로 표시 |
+| `migrate watch RUNID` | 단계, 다운타임, 복제 지연, 실패 요청 수, 누락 수를 실시간으로 표시. `--observe`로 시작한 run은 전환 뒤 observe 단계마다 게이트 판정과, 자동 롤백 run 번호도 표시 |
 | `migrate switch RUNID [--watch]` | `awaiting_switch` 상태인 run의 전환 승인 |
 | `migrate abort RUNID [--reason]` | 중단 |
 | `migrate resume RUNID [--watch]` | interrupted, failed, aborted run 재개 |
@@ -71,7 +71,9 @@ charlie logout
 
 - `--auto-switch`: 데이터가 따라잡히면 승인을 기다리지 않고 바로 전환합니다.
 - `--canary 10,50 --canary-step 20s`: 전환 전에 읽기 요청을 대상으로 10%, 50% 순서로 보내고 게이트를 판정합니다.
-- `--max-error-rate`, `--max-p95`, `--min-requests`: 게이트 기준을 바꿉니다. 지정하지 않으면 서버 기본값을 씁니다.
+- `--observe 2m --observe-step 20s`: 전환이 끝난 뒤에도 정한 시간 동안 대상을 게이트로 계속 판정하고 나서 run을 끝냅니다. 게이트를 어긴 단계가 나오면 관찰을 멈추고, run은 `succeeded`로 끝나되 위반 내용을 남깁니다. 게이트웨이 http 모드 Plan에서만 쓸 수 있습니다.
+- `--auto-rollback`: `--observe`와 함께 쓰면, 게이트를 어겼을 때 서버가 바로 롤백 run을 시작합니다(행위자 `slo-guard`). 없으면 운영자가 `charlie migrate rollback`으로 정합니다.
+- `--max-error-rate`, `--max-p95`, `--min-requests`: 게이트 기준을 바꿉니다. 카나리와 observe에 같은 기준이 쓰이고, `--canary`나 `--observe`가 있어야 합니다. 지정하지 않으면 서버 기본값을 씁니다.
 - `--idempotency-key`: 같은 키로 다시 보내면 새 run을 만들지 않고 처음 run을 돌려받습니다. 지정하지 않으면 자동으로 만들어 출력합니다.
 
 모든 명령에 `--json`을 붙이면 API 응답을 JSON으로 출력합니다. `migrate watch --json`은 메시지마다 `{"event", "id", "data"}` 한 줄을 출력합니다. 색은 `--no-color`나 `NO_COLOR`로 끕니다.
@@ -99,7 +101,7 @@ charlie migrate switch <run id>
 | 3 | 지켜보던 run이 `succeeded`가 아닌 상태로 끝남 |
 | 130 | Ctrl-C로 중단 |
 
-스크립트에서는 `charlie migrate start ... --watch --auto-switch; echo $?`로 이전 성공 여부를 판단할 수 있습니다.
+스크립트에서는 `charlie migrate start ... --watch --auto-switch; echo $?`로 이전 성공 여부를 판단할 수 있습니다. observe에서 게이트를 어겨도 데이터는 옮겨졌으므로 run은 `succeeded`이고 종료 코드는 0입니다. 위반 여부는 화면이나 `--json`의 `observe.passed`로 확인합니다.
 
 ## 보안 뷰와 에이전트 기록
 
