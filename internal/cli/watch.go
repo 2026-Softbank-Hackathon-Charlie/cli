@@ -39,14 +39,23 @@ func switchHint(runID string) string {
 // runView is the latest snapshot patched by the events after it. The server
 // sends snapshots only at the start and the end of a stream, so live progress
 // comes from the events.
+//
+// A snapshot already reflects every event up to its updatedAt, and the server
+// replays those events right after it. Such a stale event changes only what
+// the snapshot lacks: the replication lag, and the canary step being measured
+// (the server records a step once its gate has run).
 type runView struct {
 	run    apiv1.Run
 	have   bool
+	snapAt time.Time // updatedAt of the latest snapshot
 	steps  map[string]apiv1.StepRecord
-	canary []apiv1.CanaryStep
-	lag    *int64
-	lagAt  time.Time
-	recent []string
+	// canary holds one row per weight and attempt. The first snapRows rows
+	// came from the latest snapshot; the current attempt starts at attempt.
+	canary            []apiv1.CanaryStep
+	snapRows, attempt int
+	lag               *int64
+	lagAt             time.Time
+	recent            []string
 }
 
 func newRunView() *runView { return &runView{steps: map[string]apiv1.StepRecord{}} }
@@ -61,23 +70,92 @@ func (v *runView) apply(m client.Message) {
 }
 
 func (v *runView) snapshot(r *apiv1.Run) {
-	v.run, v.have = *r, true
+	var open *apiv1.CanaryStep
+	if n := len(v.canary); n > 0 && v.canary[n-1].EndedAt == nil {
+		open = &v.canary[n-1]
+	}
+	v.run, v.have, v.snapAt = *r, true, r.UpdatedAt
 	v.steps = make(map[string]apiv1.StepRecord, len(r.Engine.Steps))
 	for k, s := range r.Engine.Steps {
 		v.steps[k] = s
 	}
-	v.canary = nil
+	var rows []apiv1.CanaryStep
 	if r.Canary != nil {
-		v.canary = append(v.canary, r.Canary.Steps...)
+		rows = append(rows, r.Canary.Steps...)
+	}
+	v.canary, v.snapRows, v.attempt = rows, len(rows), 0
+	// A reconnect snapshot lacks the step being measured, and its
+	// canary_step is not replayed.
+	if open != nil && v.measuring() && v.row(open.Weight) < 0 {
+		v.canary = append(v.canary, *open)
 	}
 }
 
+// measuring reports whether the run is in a canary step.
+func (v *runView) measuring() bool {
+	return v.run.Status == apiv1.RunStatusRunning && v.run.Phase == apiv1.RunPhaseCanary
+}
+
+// row is the index of the current attempt's canary row for weight w, or -1.
+func (v *runView) row(w int) int {
+	for i := v.attempt; i < len(v.canary); i++ {
+		if v.canary[i].Weight == w {
+			return i
+		}
+	}
+	return -1
+}
+
 func (v *runView) event(e *apiv1.RunEvent) {
-	step := str(e.Step)
+	v.recent = append(v.recent, eventLine(e))
+	if len(v.recent) > recentLines {
+		v.recent = v.recent[len(v.recent)-recentLines:]
+	}
 	data := map[string]any{}
 	if e.Data != nil {
 		data = *e.Data
 	}
+	if n, ok := num(data, "lagBytes"); ok && (e.Kind == kindMetric || e.Kind == kindDone) {
+		lag := int64(n)
+		v.lag, v.lagAt = &lag, e.Time
+	}
+	if e.Time.After(v.snapAt) {
+		v.liveEvent(e, data)
+	} else {
+		v.staleEvent(e, data)
+	}
+}
+
+// staleEvent applies a replayed event that the latest snapshot already
+// reflects, so it can only rebuild the canary step being measured. A
+// snapshot row for its weight means the event is from this attempt; a
+// provisional row (after the snapshot rows) that a later stale event
+// contradicts was from an earlier attempt.
+func (v *runView) staleEvent(e *apiv1.RunEvent, data map[string]any) {
+	w, _ := num(data, "weight")
+	switch e.Kind {
+	case kindCanaryStep:
+		if w > 0 && v.row(int(w)) >= 0 {
+			return
+		}
+		v.canary = v.canary[:v.snapRows]
+		if w > 0 && v.measuring() {
+			v.canary = append(v.canary, apiv1.CanaryStep{Weight: int(w), StartedAt: e.Time})
+		}
+	case kindGateResult: // that step ended before the snapshot
+		if v.row(int(w)) >= v.snapRows {
+			v.canary = v.canary[:v.snapRows]
+		}
+	case kindStatusChanged: // a canary attempt started before the snapshot
+		if p, _ := data["phase"].(string); apiv1.RunPhase(p) == apiv1.RunPhaseCanary {
+			v.canary = v.canary[:v.snapRows]
+		}
+	}
+}
+
+// liveEvent applies an event that happened after the latest snapshot.
+func (v *runView) liveEvent(e *apiv1.RunEvent, data map[string]any) {
+	step := str(e.Step)
 	at := e.Time
 	switch e.Kind {
 	case kindStepStarted:
@@ -105,15 +183,14 @@ func (v *runView) event(e *apiv1.RunEvent) {
 			v.steps[step] = rec
 		}
 	case kindMetric, kindDone:
-		if n, ok := num(data, "lagBytes"); ok {
-			lag := int64(n)
-			v.lag, v.lagAt = &lag, at
-		}
 		if n, ok := num(data, "downtimeMillis"); ok {
 			d := int64(n)
 			v.run.Result.DowntimeMillis = &d
 		}
 	case kindStatusChanged:
+		if p, _ := data["phase"].(string); apiv1.RunPhase(p) == apiv1.RunPhaseCanary && v.run.Phase != apiv1.RunPhaseCanary {
+			v.attempt = len(v.canary) // a new canary attempt
+		}
 		if s, ok := data["status"].(string); ok {
 			v.run.Status = apiv1.RunStatus(s)
 		}
@@ -124,12 +201,17 @@ func (v *runView) event(e *apiv1.RunEvent) {
 			v.run.StatusReason = &r
 		}
 	case kindCanaryStep:
+		w, _ := num(data, "weight")
+		if w > 0 && v.row(int(w)) >= 0 {
+			break // replayed
+		}
 		if n := len(v.canary); n > 0 && v.canary[n-1].EndedAt == nil {
 			v.canary[n-1].EndedAt = &at
 		}
-		// Weight 0 means all reads went back to the source.
-		if w, ok := num(data, "weight"); ok && w > 0 {
+		if w > 0 {
 			v.canary = append(v.canary, apiv1.CanaryStep{Weight: int(w), StartedAt: at})
+		} else { // all reads went back to the source: the attempt is over
+			v.attempt = len(v.canary)
 		}
 	case kindGateResult:
 		var gate apiv1.GateResult
@@ -137,19 +219,15 @@ func (v *runView) event(e *apiv1.RunEvent) {
 		if !decodeAs(data["gate"], &gate) {
 			break
 		}
-		for i := len(v.canary) - 1; i >= 0; i-- {
-			if v.canary[i].Weight == int(w) {
-				v.canary[i].Gate = &gate
-				if v.canary[i].EndedAt == nil {
-					v.canary[i].EndedAt = &at
-				}
-				break
-			}
+		i := v.row(int(w))
+		if i < 0 { // the step failed before its canary_step, e.g. the gateway was down
+			v.canary = append(v.canary, apiv1.CanaryStep{Weight: int(w), StartedAt: at})
+			i = len(v.canary) - 1
 		}
-	}
-	v.recent = append(v.recent, eventLine(e))
-	if len(v.recent) > recentLines {
-		v.recent = v.recent[len(v.recent)-recentLines:]
+		v.canary[i].Gate = &gate
+		if v.canary[i].EndedAt == nil {
+			v.canary[i].EndedAt = &at
+		}
 	}
 }
 

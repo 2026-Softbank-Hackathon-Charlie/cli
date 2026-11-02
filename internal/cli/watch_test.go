@@ -240,3 +240,154 @@ func TestFrame(t *testing.T) {
 		t.Errorf("hint dropped:\n%s", small)
 	}
 }
+
+func tsec(n int) time.Time { return t0.Add(time.Duration(n) * time.Second) }
+
+// feed applies one event at t0+sec seconds, with sec as its seq.
+func feed(t *testing.T, v *runView, sec int, kind, step string, data map[string]any) {
+	t.Helper()
+	e := apiv1.RunEvent{Seq: int64(sec), Time: tsec(sec), RunId: "run_1", Kind: kind}
+	if step != "" {
+		e.Step = &step
+	}
+	if data != nil {
+		e.Data = &data
+	}
+	e = normalize(t, e) // numbers in data become float64, as from the wire
+	v.apply(client.Message{Name: kind, Seq: e.Seq, Event: &e})
+}
+
+func weight(w int) map[string]any { return map[string]any{"weight": w} }
+
+func gateData(w int, passed bool) map[string]any {
+	return map[string]any{"weight": w, "gate": map[string]any{"passed": passed, "reason": "r", "requests": 230, "errorRate": 0, "p95Millis": 120}}
+}
+
+func status(s apiv1.RunStatus, p apiv1.RunPhase) map[string]any {
+	return map[string]any{"status": string(s), "phase": string(p)}
+}
+
+// canaryRows lists the view's canary rows as weight@start-end, in seconds
+// after t0, with the gate verdict.
+func canaryRows(v *runView) string {
+	var rows []string
+	for _, s := range v.canary {
+		r := fmt.Sprintf("%d%%@%g-", s.Weight, s.StartedAt.Sub(t0).Seconds())
+		if s.EndedAt != nil {
+			r += fmt.Sprintf("%g", s.EndedAt.Sub(t0).Seconds())
+		}
+		if s.Gate != nil {
+			r += map[bool]string{true: " [ok]", false: " [x]"}[s.Gate.Passed]
+		}
+		rows = append(rows, r)
+	}
+	return strings.Join(rows, ", ")
+}
+
+func canaryRun(status apiv1.RunStatus, phase apiv1.RunPhase, updated int, steps ...apiv1.CanaryStep) *apiv1.Run {
+	r := fixtureRun(status)
+	r.Phase, r.UpdatedAt = phase, tsec(updated)
+	r.Canary = &apiv1.CanaryResult{Options: apiv1.CanaryOptions{Weights: []int{10, 50}}, Steps: append([]apiv1.CanaryStep{}, steps...)}
+	return &r
+}
+
+func doneStep(w, start, end int) apiv1.CanaryStep {
+	return apiv1.CanaryStep{Weight: w, StartedAt: tsec(start), EndedAt: ptr(tsec(end)), Gate: &apiv1.GateResult{Passed: true, Reason: "r"}}
+}
+
+// The first snapshot already shows every stored event, and the server then
+// replays them. They once added a second row per canary weight.
+func TestViewSkipsEventsTheSnapshotShows(t *testing.T) {
+	run := canaryRun(apiv1.RunStatusAwaitingSwitch, apiv1.RunPhaseAwaitingSwitch, 50, doneStep(10, 5, 25), doneStep(50, 26, 46))
+	run.Engine.Steps["presync"] = apiv1.StepRecord{Status: apiv1.StepStatusSucceeded, StartedAt: ptr(tsec(1)), EndedAt: ptr(tsec(4))}
+	v := newRunView()
+	v.apply(client.Message{Name: "snapshot", Snapshot: run})
+	feed(t, v, 1, kindStepStarted, "presync", nil)
+	feed(t, v, 4, kindStepSucceeded, "presync", map[string]any{"durationMillis": 3000})
+	feed(t, v, 5, kindCanaryStep, "", weight(10))
+	feed(t, v, 25, kindGateResult, "", gateData(10, false)) // differs from the snapshot, which wins
+	feed(t, v, 26, kindCanaryStep, "", weight(50))
+	feed(t, v, 46, kindGateResult, "", gateData(50, true))
+	feed(t, v, 47, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseCanary))
+	feed(t, v, 48, kindMetric, "delta", map[string]any{"lagBytes": 512, "downtimeMillis": 9000})
+	feed(t, v, 50, kindStatusChanged, "", status(apiv1.RunStatusAwaitingSwitch, apiv1.RunPhaseAwaitingSwitch))
+
+	if got, want := canaryRows(v), "10%@5-25 [ok], 50%@26-46 [ok]"; got != want {
+		t.Errorf("canary rows %q, want %q", got, want)
+	}
+	if v.run.Status != apiv1.RunStatusAwaitingSwitch || v.run.Result.DowntimeMillis != nil {
+		t.Errorf("replayed events changed the run: %s, downtime %v", v.run.Status, v.run.Result.DowntimeMillis)
+	}
+	out := v.frame(tsec(60), 0, 0)
+	for _, want := range []string{
+		"presync     [ok] succeeded  3.0s",
+		"Replication lag:  512 B at " + clock(tsec(48)), // the snapshot has no lag
+		"[ok] presync succeeded in 3.0s",                // replayed events are still listed
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("frame lacks %q:\n%s", want, out)
+		}
+	}
+
+	// Events after the snapshot apply.
+	feed(t, v, 61, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseCutover))
+	feed(t, v, 62, kindStepStarted, "fence", nil)
+	if v.run.Phase != apiv1.RunPhaseCutover || v.steps["fence"].Status != apiv1.StepStatusRunning {
+		t.Errorf("live events not applied: phase %s, fence %+v", v.run.Phase, v.steps["fence"])
+	}
+}
+
+// The server records a canary step only once its gate has run, so the step
+// being measured comes from its replayed canary_step.
+func TestViewRebuildsMeasuredCanaryStep(t *testing.T) {
+	v := newRunView()
+	v.apply(client.Message{Name: "snapshot", Snapshot: canaryRun(apiv1.RunStatusRunning, apiv1.RunPhaseCanary, 30, doneStep(10, 5, 25))})
+	feed(t, v, 5, kindCanaryStep, "", weight(10))
+	feed(t, v, 25, kindGateResult, "", gateData(10, true))
+	feed(t, v, 26, kindCanaryStep, "", weight(50))
+	if got, want := canaryRows(v), "10%@5-25 [ok], 50%@26-"; got != want {
+		t.Fatalf("canary rows %q, want %q", got, want)
+	}
+	// A reconnect snapshot lacks the step too, and nothing up to seq 26 is
+	// replayed again.
+	v.apply(client.Message{Name: "snapshot", Snapshot: canaryRun(apiv1.RunStatusRunning, apiv1.RunPhaseCanary, 40, doneStep(10, 5, 25))})
+	feed(t, v, 46, kindGateResult, "", gateData(50, true))
+	feed(t, v, 46, kindGateResult, "", gateData(50, true))
+	if got, want := canaryRows(v), "10%@5-25 [ok], 50%@26-46 [ok]"; got != want {
+		t.Errorf("canary rows %q, want %q", got, want)
+	}
+}
+
+func TestViewCanaryAttempts(t *testing.T) {
+	v := newRunView()
+	v.apply(client.Message{Name: "snapshot", Snapshot: canaryRun(apiv1.RunStatusRunning, apiv1.RunPhaseCanary, 20)})
+	// Replayed: an aborted attempt, then the resumed one, which is measuring
+	// 10%. The snapshot holds only the current attempt's finished steps.
+	feed(t, v, 1, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseCanary))
+	feed(t, v, 2, kindCanaryStep, "", weight(10))
+	feed(t, v, 3, kindGateResult, "", gateData(10, true))
+	feed(t, v, 4, kindCanaryStep, "", weight(50))
+	feed(t, v, 5, kindStatusChanged, "", status(apiv1.RunStatusAborted, apiv1.RunPhaseDone))
+	feed(t, v, 6, kindCanaryStep, "", weight(0))
+	feed(t, v, 10, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseSync))
+	feed(t, v, 11, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseCanary))
+	feed(t, v, 12, kindCanaryStep, "", weight(10))
+	if got, want := canaryRows(v), "10%@12-"; got != want {
+		t.Fatalf("after the replay: canary rows %q, want %q", got, want)
+	}
+
+	// Live: a repeated canary_step adds no row, and a resumed attempt
+	// starts new rows.
+	feed(t, v, 31, kindGateResult, "", gateData(10, true))
+	feed(t, v, 32, kindCanaryStep, "", weight(50))
+	feed(t, v, 33, kindCanaryStep, "", weight(50))
+	feed(t, v, 40, kindStatusChanged, "", status(apiv1.RunStatusAborted, apiv1.RunPhaseDone))
+	feed(t, v, 41, kindCanaryStep, "", weight(0))
+	feed(t, v, 50, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseSync))
+	feed(t, v, 51, kindStatusChanged, "", status(apiv1.RunStatusRunning, apiv1.RunPhaseCanary))
+	feed(t, v, 52, kindCanaryStep, "", weight(10))
+	feed(t, v, 53, kindCanaryStep, "", weight(10))
+	if got, want := canaryRows(v), "10%@12-31 [ok], 50%@32-41, 10%@52-"; got != want {
+		t.Errorf("canary rows %q, want %q", got, want)
+	}
+}

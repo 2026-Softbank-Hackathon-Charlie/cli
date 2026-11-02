@@ -124,7 +124,9 @@ func (g *globals) rootCmd() *cobra.Command {
 traffic, the result matrix and the audit log.
 
 Log in once with "charlie login --server URL"; CHARLIE_SERVER and CHARLIE_TOKEN
-override the saved login, and --server overrides both.`,
+override the saved login, and --server overrides both. The saved token is only
+sent to the server it was saved for; for another server set CHARLIE_TOKEN or
+log in to it.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          noArgs,
@@ -186,10 +188,12 @@ func exactArgs(names ...string) cobra.PositionalArgs {
 type settings struct {
 	server, token string
 	path          string // config file
+	savedServer   string // set when the saved token is for another server
 }
 
 // settings applies the precedence: --server, then CHARLIE_SERVER and
-// CHARLIE_TOKEN, then the saved login.
+// CHARLIE_TOKEN, then the saved login. The saved token is used only for the
+// saved server.
 func (g *globals) settings(cmd *cobra.Command) (settings, error) {
 	path, err := configPath(g.app.ConfigDir)
 	if err != nil {
@@ -199,12 +203,9 @@ func (g *globals) settings(cmd *cobra.Command) (settings, error) {
 	if err != nil {
 		return settings{}, err
 	}
-	s := settings{server: file.Server, token: file.Token, path: path}
+	s := settings{server: file.Server, path: path}
 	if v := g.app.Getenv("CHARLIE_SERVER"); v != "" {
 		s.server = v
-	}
-	if v := g.app.Getenv("CHARLIE_TOKEN"); v != "" {
-		s.token = v
 	}
 	if g.server != "" {
 		u, err := normalizeServer(g.server)
@@ -218,6 +219,20 @@ func (g *globals) settings(cmd *cobra.Command) (settings, error) {
 			return s, err
 		}
 		s.server = u
+	}
+	if file.Token != "" {
+		saved, err := normalizeServer(file.Server)
+		if err != nil {
+			saved = file.Server
+		}
+		if saved == s.server {
+			s.token = file.Token
+		} else {
+			s.savedServer = saved
+		}
+	}
+	if v := g.app.Getenv("CHARLIE_TOKEN"); v != "" {
+		s.token = v
 	}
 	return s, nil
 }
@@ -238,6 +253,10 @@ func (g *globals) client(cmd *cobra.Command) (*client.Client, error) {
 	}
 	if s.server == "" {
 		return nil, errors.New(`no server configured; run "charlie login --server URL" or set CHARLIE_SERVER`)
+	}
+	if s.token == "" && s.savedServer != "" {
+		return nil, fmt.Errorf(`the saved login is for %s, not %s; run "charlie login --server %s" or set CHARLIE_TOKEN`,
+			s.savedServer, s.server, s.server)
 	}
 	if s.token == "" {
 		return nil, fmt.Errorf(`not logged in to %s; run "charlie login" or set CHARLIE_TOKEN`, s.server)

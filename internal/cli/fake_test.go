@@ -225,8 +225,8 @@ func fixtureEnvs() apiv1.EnvironmentList {
 func fixturePlan(ref string, status apiv1.PlanStatus) apiv1.PlanRecord {
 	p := apiv1.PlanRecord{Ref: ref, Status: status, SubmittedBy: "planner", SubmittedAt: t0,
 		Summary: apiv1.PlanSummary{PlanId: "shop-gke-eks", Files: true, GatewayMode: "http", FenceGate: true, MaxDowntime: "3m",
-			Source: apiv1.PlanEndpoint{Env: "gke", Namespace: "shop", Cluster: "pg"},
-			Target: apiv1.PlanEndpoint{Env: "eks", Namespace: "shop", Cluster: "pg"}}}
+			Source: apiv1.PlanEndpoint{Env: "gke", Namespace: "shop", Cluster: "pg", DbHost: ptr("10.0.1.5:5432")},
+			Target: apiv1.PlanEndpoint{Env: "eks", Namespace: "shop", Cluster: "pg", DbHost: ptr("pg.eks.example.com:5432")}}}
 	if status == apiv1.PlanStatusStarted {
 		p.RunId = ptr("run_1")
 	}

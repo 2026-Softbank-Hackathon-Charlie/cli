@@ -162,7 +162,9 @@ func renderPlan(p *apiv1.PlanRecord) string {
 		{"Status", planMark(p.Status) + " " + string(p.Status)},
 		{"Plan id", s.PlanId},
 		{"Source", endpoint(s.Source)},
+		{"Source DB host", str(s.Source.DbHost)}, // where the database password goes
 		{"Target", endpoint(s.Target)},
+		{"Target DB host", str(s.Target.DbHost)},
 		{"Moves files", yesNo(s.Files)},
 		{"Gateway mode", s.GatewayMode},
 		{"Fence gate", yesNo(s.FenceGate)},

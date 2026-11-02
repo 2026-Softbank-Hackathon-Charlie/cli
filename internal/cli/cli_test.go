@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"os"
@@ -105,37 +106,69 @@ func TestLoginFailures(t *testing.T) {
 
 func TestSettingsPrecedence(t *testing.T) {
 	a, b, c := newFake(t, ""), newFake(t, ""), newFake(t, "")
+	otherServer := func(f *fakeServer) string {
+		return `the saved login is for ` + a.URL + `, not ` + f.URL + `; run "charlie login --server ` + f.URL + `" or set CHARLIE_TOKEN`
+	}
 	cases := []struct {
 		name      string
+		saved     string // server of the saved login; a.URL when empty
 		env       map[string]string
 		args      []string
-		want      *fakeServer
+		want      *fakeServer // nil: no request at all
 		wantToken string
+		wantErr   string
 	}{
-		{"saved login", nil, nil, a, "file-token"},
-		{"CHARLIE_SERVER over file", map[string]string{"CHARLIE_SERVER": b.URL}, nil, b, "file-token"},
-		{"CHARLIE_TOKEN over file", map[string]string{"CHARLIE_TOKEN": "env-token"}, nil, a, "env-token"},
-		{"--server over env and file", map[string]string{"CHARLIE_SERVER": b.URL, "CHARLIE_TOKEN": "env-token"}, []string{"--server", c.URL}, c, "env-token"},
-		{"--server over file", nil, []string{"--server", c.URL}, c, "file-token"},
+		{"saved login", "", nil, nil, a, "file-token", ""},
+		{"CHARLIE_TOKEN over file", "", map[string]string{"CHARLIE_TOKEN": "env-token"}, nil, a, "env-token", ""},
+		{"CHARLIE_SERVER and CHARLIE_TOKEN over file", "", map[string]string{"CHARLIE_SERVER": b.URL, "CHARLIE_TOKEN": "env-token"}, nil, b, "env-token", ""},
+		{"--server over env and file", "", map[string]string{"CHARLIE_SERVER": b.URL, "CHARLIE_TOKEN": "env-token"}, []string{"--server", c.URL}, c, "env-token", ""},
+		{"--server naming the saved server", "", nil, []string{"--server", a.URL + "/"}, a, "file-token", ""},
+		{"CHARLIE_SERVER naming the saved server", a.URL + "/", map[string]string{"CHARLIE_SERVER": a.URL}, nil, a, "file-token", ""},
+		// The saved token never goes to another server.
+		{"CHARLIE_SERVER elsewhere", "", map[string]string{"CHARLIE_SERVER": b.URL}, nil, nil, "", otherServer(b)},
+		{"--server elsewhere", "", nil, []string{"--server", c.URL}, nil, "", otherServer(c)},
+		{"--server elsewhere over CHARLIE_SERVER", "", map[string]string{"CHARLIE_SERVER": a.URL}, []string{"--server", c.URL}, nil, "", otherServer(c)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, tc.env)
-			if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: a.URL, Token: "file-token"}); err != nil {
+			saved := cmp.Or(tc.saved, a.URL)
+			if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: saved, Token: "file-token"}); err != nil {
 				t.Fatal(err)
 			}
 			before := map[*fakeServer]int{a: len(a.requests()), b: len(b.requests()), c: len(c.requests())}
-			h.run("", append(tc.args, "whoami")...).ok(t)
+			r := h.run("", append(tc.args, "whoami")...)
+			if tc.wantErr != "" {
+				if r.code != ExitError || !strings.Contains(r.stderr, tc.wantErr) {
+					t.Errorf("exit %d, stderr %q, want %q", r.code, r.stderr, tc.wantErr)
+				}
+			} else {
+				r.ok(t)
+			}
 			for _, f := range []*fakeServer{a, b, c} {
 				got := len(f.requests()) - before[f]
 				if (f == tc.want) != (got == 1) {
 					t.Errorf("server %s got %d requests", f.URL, got)
 				}
 			}
+			if tc.want == nil {
+				return
+			}
 			if got := tc.want.last(t, "GET", "/v1/me").header.Get("Authorization"); got != "Bearer "+tc.wantToken {
 				t.Errorf("Authorization = %q, want token %q", got, tc.wantToken)
 			}
 		})
+	}
+
+	// Logging in to the other server still works, and replaces the saved login.
+	h := newHarness(t, nil)
+	if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: a.URL, Token: "file-token"}); err != nil {
+		t.Fatal(err)
+	}
+	h.run("c-token\n", "login", "--server", c.URL).ok(t)
+	h.run("", "whoami").ok(t)
+	if got := c.last(t, "GET", "/v1/me").header.Get("Authorization"); got != "Bearer c-token" {
+		t.Errorf("after login to c, Authorization = %q", got)
 	}
 }
 
@@ -335,6 +368,21 @@ func TestPlanCommands(t *testing.T) {
 	h.run("", "plan", "reject", "pln_2", "--comment", "wrong target").ok(t)
 	if got := string(f.last(t, "POST", "/v1/plans/pln_2/reject").body); got != `{"comment":"wrong target"}` {
 		t.Errorf("reject body %s", got)
+	}
+
+	// Whoever reviews a plan sees where the database passwords would go.
+	for _, args := range [][]string{
+		{"plan", "show", "pln_1"},
+		{"plan", "submit", "-f", file},
+		{"plan", "approve", "pln_2"},
+		{"plan", "reject", "pln_2", "--comment", "no"},
+	} {
+		out := h.run("", args...).ok(t).stdout
+		for _, want := range []string{"Source DB host:  10.0.1.5:5432", "Target DB host:  pg.eks.example.com:5432"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%v lacks %q:\n%s", args, want, out)
+			}
+		}
 	}
 }
 
