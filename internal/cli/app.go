@@ -9,9 +9,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/2026-Softbank-Hackathon-Charlie/cli/internal/update"
 	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/client"
 	"github.com/spf13/cobra"
 )
@@ -38,11 +40,13 @@ type App struct {
 	Getenv     func(string) string
 	ConfigDir  func() (string, error) // charlie/config.json lives below it
 	HTTPClient *http.Client
+	// Updater keeps an installed charlie current; nil turns updates off (tests).
+	Updater *update.Config
 }
 
 // New returns an App wired to the real process.
 func New(version string) *App {
-	return &App{
+	a := &App{
 		Version:    version,
 		Stdin:      os.Stdin,
 		Stdout:     os.Stdout,
@@ -51,6 +55,11 @@ func New(version string) *App {
 		ConfigDir:  os.UserConfigDir,
 		HTTPClient: http.DefaultClient,
 	}
+	if dir, err := os.UserConfigDir(); err == nil {
+		u := update.Default(filepath.Join(dir, "charlie"))
+		a.Updater = &u
+	}
+	return a
 }
 
 // Run executes args (without the program name) and returns the exit code.
@@ -61,7 +70,23 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	root.SetIn(a.Stdin)
 	root.SetOut(a.Stdout)
 	root.SetErr(a.Stderr)
-	return a.exit(root.ExecuteContext(ctx))
+
+	if a.Updater != nil {
+		if exe, err := a.Updater.Executable(); err == nil {
+			update.CleanOld(exe)
+		}
+		if msg := update.TakeNotice(*a.Updater); msg != "" {
+			fmt.Fprintln(a.Stderr, msg)
+		}
+	}
+	cmd, err := root.ExecuteContextC(ctx)
+	code := a.exit(err)
+	// After the command, so it never delays the output; the update itself
+	// runs in a separate process.
+	if a.Updater != nil && (cmd == nil || cmd.Name() != "update") {
+		update.MaybeStart(*a.Updater)
+	}
+	return code
 }
 
 func (a *App) exit(err error) int {
@@ -142,7 +167,7 @@ log in to it.`,
 	root.AddCommand(
 		g.loginCmd(), g.logoutCmd(), g.whoamiCmd(),
 		g.envCmd(), g.planCmd(), g.migrateCmd(),
-		g.trafficCmd(), g.matrixCmd(), g.auditCmd(), g.versionCmd(),
+		g.trafficCmd(), g.matrixCmd(), g.auditCmd(), g.versionCmd(), g.updateCmd(),
 	)
 	return root
 }
