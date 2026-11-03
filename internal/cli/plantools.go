@@ -158,15 +158,16 @@ func (g *globals) appsCmd() *cobra.Command {
 }
 
 func renderApps(l *apiv1.AppList) string {
-	if len(l.Apps) == 0 {
-		return "No apps configured on the server (PLATFORM_APPS_FILE).\n"
-	}
 	rows := [][]string{{"APP", "NAMESPACE", "DATABASE", "SCHEMAS", "ENV", "CLUSTER", "DB HOST", "BUCKET"}}
 	for _, a := range l.Apps {
 		db := a.Database.User + "@" + a.Database.Name
 		for _, e := range a.Environments {
 			rows = append(rows, []string{a.Name, a.Namespace, db, strings.Join(a.Database.Schemas, ","), e.Env, e.CnpgCluster, e.DbHost, str(e.Bucket)})
 		}
+	}
+	// An app registered from GitHub only has no environments here.
+	if len(rows) == 1 {
+		return "No apps configured on the server (PLATFORM_APPS_FILE).\n"
 	}
 	return table(rows)
 }
