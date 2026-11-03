@@ -95,6 +95,7 @@ func (a *App) exit(err error) int {
 	}
 	var ee *exitError
 	var ue *usageError
+	var se *client.AppSpecError
 	switch {
 	case errors.As(err, &ee):
 		if ee.msg != "" {
@@ -104,6 +105,10 @@ func (a *App) exit(err error) int {
 	case errors.As(err, &ue):
 		fmt.Fprintf(a.Stderr, "error: %v\nRun '%s --help' for usage.\n", ue.err, ue.cmd.CommandPath())
 		return ExitUsage
+	case errors.As(err, &se):
+		// A 422 invalid_app_spec lists every rule platform.yaml breaks.
+		fmt.Fprintf(a.Stderr, "error: %v\n%s", err, specErrors(se.Validation.Errors))
+		return ExitError
 	case errors.Is(err, context.Canceled):
 		fmt.Fprintln(a.Stderr, "interrupted")
 		return ExitInterrupted
@@ -145,8 +150,9 @@ func (g *globals) rootCmd() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "charlie",
 		Short: "Command line for the HopCharlie multi-cloud migration platform",
-		Long: `charlie talks to the HopCharlie platform API: environments, plans, migrations,
-traffic, the result matrix and the audit log.
+		Long: `charlie talks to the HopCharlie platform API: environments, apps registered
+from GitHub and their deployments, plans, migrations, traffic, the result
+matrix and the audit log.
 
 Log in once with "charlie login --server URL"; CHARLIE_SERVER and CHARLIE_TOKEN
 override the saved login, and --server overrides both. The saved token is only
@@ -168,7 +174,7 @@ log in to it.`,
 		g.loginCmd(), g.logoutCmd(), g.whoamiCmd(),
 		g.envCmd(), g.planCmd(), g.migrateCmd(),
 		g.trafficCmd(), g.matrixCmd(), g.auditCmd(), g.versionCmd(), g.updateCmd(),
-		g.securityCmd(), g.agentCmd(),
+		g.securityCmd(), g.agentCmd(), g.appCmd(), g.deployCmd(),
 	)
 	g.addPlanTools(root)
 	return root

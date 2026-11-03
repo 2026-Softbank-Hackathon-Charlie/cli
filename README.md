@@ -46,7 +46,7 @@ charlie logout
 | 명령 | 설명 |
 | --- | --- |
 | `env list`, `env show NAME` | 환경과 클러스터 실시간 상태 (노드, 버전, CNPG, 쓰기를 받는 환경) |
-| `apps` | 플랫폼에 등록된 앱과, 앱이 있는 환경 |
+| `apps` | 서버 앱 파일(`PLATFORM_APPS_FILE`)의 앱과 환경별 DB, 버킷. `plan new`가 쓰는 설정이다. GitHub에서 등록한 앱은 `app list`로 본다 |
 | `plan new --app APP --from ENV --to ENV [--stream NAME] [--submit]` | 등록된 설정으로 엔진 Plan 초안을 만든다. `--submit`이면 바로 제출 |
 | `plan submit -f FILE` | 엔진 Plan 제출 (`-f -`는 표준 입력) |
 | `plan attach REF --name NAME -f FILE` | 승인 전 Plan에 파일(대상 CNPG 매니페스트 등)을 붙인다. Plan에서는 `attachment:NAME`으로 가리킨다. 올릴 때마다 Plan의 revision이 1 늘어난다 |
@@ -91,14 +91,56 @@ charlie migrate switch <run id>
 
 `watch`는 run이 `awaiting_switch`에 머무는 동안 계속 따라가고, 연결이 끊기면 마지막으로 받은 이벤트 번호부터 다시 받습니다.
 
+## GitHub 레포로 앱 등록과 배포
+
+앱 레포에는 서비스마다 Dockerfile을, 루트에 `platform.yaml`을 둡니다(형식은 platform 레포 `docs/adr/0011-github-app-deploy.md`). 플랫폼이 이미지를 빌드해 gitops 레포에 커밋하면 Argo CD가 환경마다 배포합니다.
+
+| 명령 | 설명 |
+| --- | --- |
+| `app validate [-f platform.yaml]` | `platform.yaml`을 서버와 같은 규칙(`pkg/appspec`)으로 로컬에서 검사한다. 로그인이 필요 없다. `-f -`는 표준 입력 |
+| `app validate --remote --repo OWNER/NAME [--branch B]` | 플랫폼이 GitHub App으로 레포 브랜치 head의 `platform.yaml`을 읽어 검사한다. 서비스마다 Dockerfile이 있는지도 본다 |
+| `app repos` | 플랫폼의 GitHub App이 볼 수 있는 레포 |
+| `app add --repo OWNER/NAME --env ENV [--env ENV...] [--branch main] [--no-auto-deploy] [--watch]` | 레포를 앱으로 등록하고 첫 배포를 큐에 넣는다 (operator). 앱 이름은 `platform.yaml`의 `name`이다. `--no-auto-deploy`가 없으면 브랜치에 push 할 때마다 다시 배포한다 |
+| `app list` | GitHub에서 등록한 앱의 레포, 브랜치, 환경별 상태, 커밋, URL과, 앱 파일의 앱 |
+| `app show NAME` | 앱 상세, `platform.yaml` 요약(서비스, 포트, 리소스), 환경별 Argo CD 상태, 최근 배포 5개 |
+| `app rm NAME [--yes]` | 등록을 지운다 (operator). Argo CD가 모든 환경에서 워크로드와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 앱 이름을 입력해야 지운다 |
+| `deploy APP [--ref REF] [--env ENV...] [--watch]` | 지금 배포한다 (operator). `--ref`는 브랜치나 커밋, 기본은 앱의 브랜치다. `--env`가 없으면 앱의 모든 환경 |
+| `deploy list APP [--limit N]` | 배포 목록 (최신순, 기본 20개) |
+| `deploy show ID` | 배포 상세: 상태, 커밋, 트리거, 환경별 상태, 빌드한 이미지 |
+| `deploy watch ID` | 단계, 환경별 상태, 빌드와 배포 로그, 경과 시간을 실시간으로 표시하고, 끝나면 앱 URL을 보여 준다 |
+| `deploy logs ID [--follow]` | 빌드와 배포 로그. `--follow`면 배포가 끝날 때까지 계속 출력한다 |
+
+- `platform.yaml`이 규칙을 어기면 `app add`, `deploy`는 422로 끝나고, 어긴 규칙을 경로와 함께 한 줄씩 표준 오류로 출력합니다. `app validate`는 같은 형식으로 표준 출력에 쓰고, 유효하면 0, 아니면 1로 끝납니다.
+
+  ```
+  error: invalid_app_spec: platform.yaml breaks 2 rules (HTTP 422)
+    services[0].port: must be between 1 and 65535
+    services[1].public: only one service may be public; services[0] is
+  ```
+
+- `--watch`와 `deploy watch`는 배포가 `healthy`로 끝나면 0, `failed`나 `superseded`(같은 환경에 더 새 배포가 생김)로 끝나면 3, Ctrl-C로 멈추면 130으로 끝납니다. 연결이 끊기면 마지막으로 받은 이벤트 번호부터 다시 받습니다. 터미널이 아니면 이벤트마다 한 줄을 쓰고 끝에 전체 화면을 한 번 출력합니다.
+- `environment` 이벤트에는 환경의 새 상태가 없어서, 터미널 화면은 그 이벤트를 받을 때마다 배포를 다시 읽어 환경별 상태를 고칩니다.
+- `deploy logs`는 끝나지 않은 배포에서는 지금까지 저장된 로그만 출력하고 끝납니다. 첫 snapshot 뒤 0.5초 동안 새 이벤트가 없거나 5초가 지나면 멈추고, `--follow`로 이어 보라고 표준 오류에 알려 줍니다. 로그만 읽을 때는 배포가 실패했어도 0으로 끝나고, `--follow`는 `deploy watch`와 같은 종료 코드를 씁니다.
+- `--json`이면 `app add`, `deploy`는 API 응답을, `deploy watch`와 `--watch`는 메시지마다 `{"event", "id", "data"}` 한 줄을, `deploy logs`는 `log` 이벤트만 같은 형식으로 출력합니다. `app show --json`은 `{"app", "deployments"}`, `app validate --json`은 `POST /v1/apps/validate`의 응답 형식(`valid`, `spec`, `errors`)입니다. `app rm`은 응답 본문이 없어 아무것도 출력하지 않습니다.
+
+```bash
+charlie app validate                                   # 레포 루트에서 platform.yaml 검사
+charlie app repos                                      # GitHub App이 보는 레포 확인
+charlie app add --repo 2026-Softbank-Hackathon-Charlie/moimroom --env gke --env eks --watch
+charlie app show moimroom
+git push                                               # 이후 push마다 자동 배포
+charlie deploy moimroom --ref 9fceb02 --env eks --watch    # 특정 커밋을 한 환경에만
+charlie deploy logs dep_xxx --follow
+```
+
 ## 종료 코드
 
 | 코드 | 뜻 |
 | --- | --- |
 | 0 | 성공 |
-| 1 | 오류 (API 오류 코드와 메시지를 출력) |
+| 1 | 오류 (API 오류 코드와 메시지를 출력), `app validate`에서 `platform.yaml`이 규칙을 어김 |
 | 2 | 사용법 오류 |
-| 3 | 지켜보던 run이 `succeeded`가 아닌 상태로 끝남 |
+| 3 | 지켜보던 run이 `succeeded`가 아닌 상태로, 지켜보던 배포가 `healthy`가 아닌 상태로 끝남 |
 | 130 | Ctrl-C로 중단 |
 
 스크립트에서는 `charlie migrate start ... --watch --auto-switch; echo $?`로 이전 성공 여부를 판단할 수 있습니다. observe에서 게이트를 어겨도 데이터는 옮겨졌으므로 run은 `succeeded`이고 종료 코드는 0입니다. 위반 여부는 화면이나 `--json`의 `observe.passed`로 확인합니다.
