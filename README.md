@@ -100,17 +100,21 @@ charlie migrate switch <run id>
 | `app validate [-f platform.yaml]` | `platform.yaml`을 서버와 같은 규칙(`pkg/appspec`)으로 로컬에서 검사한다. 로그인이 필요 없다. `-f -`는 표준 입력 |
 | `app validate --remote --repo OWNER/NAME [--branch B]` | 플랫폼이 GitHub App으로 레포 브랜치 head의 `platform.yaml`을 읽어 검사한다. 서비스마다 Dockerfile이 있는지도 본다 |
 | `app repos` | 플랫폼의 GitHub App이 볼 수 있는 레포 |
-| `app add --repo OWNER/NAME --env ENV [--env ENV...] [--branch main] [--no-auto-deploy] [--watch]` | 레포를 앱으로 등록하고 첫 배포를 큐에 넣는다 (operator). 앱 이름은 `platform.yaml`의 `name`이다. `--no-auto-deploy`가 없으면 브랜치에 push 할 때마다 다시 배포한다 |
-| `app list` | GitHub에서 등록한 앱의 레포, 브랜치, 환경별 상태, 커밋, URL과, 앱 파일의 앱 |
-| `app show NAME` | 앱 상세, `platform.yaml` 요약(서비스, 포트, 리소스), 환경별 Argo CD 상태, 최근 배포 5개 |
-| `app rm NAME [--yes]` | 등록을 지운다 (operator). Argo CD가 모든 환경에서 워크로드와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 앱 이름을 입력해야 지운다 |
-| `deploy APP [--ref REF] [--env ENV...] [--watch]` | 지금 배포한다 (operator). `--ref`는 브랜치나 커밋, 기본은 앱의 브랜치다. `--env`가 없으면 앱의 모든 환경 |
-| `deploy list APP [--limit N]` | 배포 목록 (최신순, 기본 20개) |
-| `deploy show ID` | 배포 상세: 상태, 커밋, 트리거, 환경별 상태, 빌드한 이미지 |
-| `deploy watch ID` | 단계, 환경별 상태, 빌드와 배포 로그, 경과 시간을 실시간으로 표시하고, 끝나면 앱 URL을 보여 준다 |
+| `app add --repo OWNER/NAME --env ENV [--env ENV...] [--branch main] [--no-auto-deploy] [--watch]` | 레포를 앱으로 등록하고 첫 배포를 큐에 넣는다 (operator). 앱 이름은 `platform.yaml`의 `name`이다. `--branch`는 앱의 기본 브랜치이고, 이 브랜치가 앱 이름의 기본 인스턴스가 된다. `--no-auto-deploy`가 없으면 브랜치에 push 할 때마다 다시 배포한다 |
+| `app list` | GitHub에서 등록한 앱의 인스턴스 수, 레포, 기본 브랜치, 환경별 상태, 커밋, URL과, 앱 파일의 앱 |
+| `app show NAME` | 앱 상세, `platform.yaml` 요약(서비스, 포트, 리소스), 환경별 Argo CD 상태, 인스턴스 목록, 최근 배포 5개 |
+| `app rm NAME [--yes]` | 등록을 지운다 (operator). gitops 레포에서 `apps/NAME/`과 추가한 인스턴스마다 `apps/<instance>/`를 지우고, Argo CD가 모든 환경에서 모든 인스턴스의 워크로드와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 앱 이름을 입력해야 지운다 |
+| `app branch add APP BRANCH [--no-auto-deploy] [--watch]` | 앱 레포의 다른 브랜치를 인스턴스 하나로 더 띄우고 첫 배포를 큐에 넣는다 (operator). 인스턴스 이름과 URL을 출력한다. `--no-auto-deploy`가 없으면 그 브랜치에 push 할 때마다 그 인스턴스에 다시 배포한다 |
+| `app branch list APP` | 앱의 인스턴스 목록: 인스턴스 이름, 브랜치, 기본 인스턴스인지, 자동 배포, 환경별 상태, 커밋, URL |
+| `app branch rm APP INSTANCE\|BRANCH [--yes]` | 추가한 인스턴스를 지운다 (operator). 인스턴스 이름이나 브랜치로 가리킨다. Argo CD가 그 인스턴스의 네임스페이스와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 인스턴스 이름을 입력해야 지운다. 기본 인스턴스는 `app rm`으로 앱과 함께만 지운다 |
+| `deploy APP [--branch B] [--ref REF] [--env ENV...] [--watch]` | 지금 배포한다 (operator). `--branch`는 어느 인스턴스에 배포할지 브랜치로 고르고, 기본은 앱의 기본 브랜치다. `--ref`는 그 인스턴스에 배포할 브랜치, 태그나 커밋이고, 기본은 그 브랜치의 head다. `--env`가 없으면 앱의 모든 환경 |
+| `deploy list APP [--branch B] [--limit N]` | 배포 목록 (최신순, 기본 20개). 모든 인스턴스의 배포를 브랜치와 함께 보여 주고, `--branch`면 그 브랜치의 인스턴스 배포만 |
+| `deploy show ID` | 배포 상세: 상태, 브랜치와 인스턴스, 커밋, 트리거, 환경별 상태, 빌드한 이미지 |
+| `deploy watch ID` | 단계, 환경별 상태, 빌드와 배포 로그, 경과 시간을 실시간으로 표시하고, 끝나면 배포한 인스턴스의 URL을 보여 준다 |
 | `deploy logs ID [--follow]` | 빌드와 배포 로그. `--follow`면 배포가 끝날 때까지 계속 출력한다 |
 
-- `platform.yaml`이 규칙을 어기면 `app add`, `deploy`는 422로 끝나고, 어긴 규칙을 경로와 함께 한 줄씩 표준 오류로 출력합니다. `app validate`는 같은 형식으로 표준 출력에 쓰고, 유효하면 0, 아니면 1로 끝납니다.
+- 앱 하나에 기본 브랜치 말고 다른 브랜치를 인스턴스로 더 띄울 수 있습니다(platform 레포 `docs/adr/0015-branch-instances.md`). 기본 인스턴스 이름은 앱 이름이고, 추가한 브랜치의 인스턴스는 `<app>--<브랜치 슬러그>`이며 URL은 `https://<instance>.hopcharlie.dev`입니다. 인스턴스마다 네임스페이스, DB, 버킷이 따로 생기고, gitops 경로는 `apps/<instance>/<env>.yaml`입니다. 앱 하나에 인스턴스는 기본 인스턴스를 포함해 3개까지입니다. 이미 추적하는 브랜치는 409 `branch_exists`, 슬러그가 같은 브랜치는 409 `instance_exists`, 3개를 넘기면 409 `instance_limit`로 끝납니다.
+- `platform.yaml`이 규칙을 어기면 `app add`, `app branch add`, `deploy`는 422로 끝나고, 어긴 규칙을 경로와 함께 한 줄씩 표준 오류로 출력합니다. `app validate`는 같은 형식으로 표준 출력에 쓰고, 유효하면 0, 아니면 1로 끝납니다.
 
   ```
   error: invalid_app_spec: platform.yaml breaks 2 rules (HTTP 422)
@@ -118,10 +122,10 @@ charlie migrate switch <run id>
     services[1].public: only one service may be public; services[0] is
   ```
 
-- `--watch`와 `deploy watch`는 배포가 `healthy`로 끝나면 0, `failed`나 `superseded`(같은 환경에 더 새 배포가 생김)로 끝나면 3, Ctrl-C로 멈추면 130으로 끝납니다. 연결이 끊기면 마지막으로 받은 이벤트 번호부터 다시 받습니다. 터미널이 아니면 이벤트마다 한 줄을 쓰고 끝에 전체 화면을 한 번 출력합니다.
+- `--watch`와 `deploy watch`는 배포가 `healthy`로 끝나면 0, `failed`나 `superseded`(같은 인스턴스의 같은 환경에 더 새 배포가 생김)로 끝나면 3, Ctrl-C로 멈추면 130으로 끝납니다. 연결이 끊기면 마지막으로 받은 이벤트 번호부터 다시 받습니다. 터미널이 아니면 이벤트마다 한 줄을 쓰고 끝에 전체 화면을 한 번 출력합니다.
 - `environment` 이벤트에는 환경의 새 상태가 없어서, 터미널 화면은 그 이벤트를 받을 때마다 배포를 다시 읽어 환경별 상태를 고칩니다.
 - `deploy logs`는 끝나지 않은 배포에서는 지금까지 저장된 로그만 출력하고 끝납니다. 첫 snapshot 뒤 0.5초 동안 새 이벤트가 없거나 5초가 지나면 멈추고, `--follow`로 이어 보라고 표준 오류에 알려 줍니다. 로그만 읽을 때는 배포가 실패했어도 0으로 끝나고, `--follow`는 `deploy watch`와 같은 종료 코드를 씁니다.
-- `--json`이면 `app add`, `deploy`는 API 응답을, `deploy watch`와 `--watch`는 메시지마다 `{"event", "id", "data"}` 한 줄을, `deploy logs`는 `log` 이벤트만 같은 형식으로 출력합니다. `app show --json`은 `{"app", "deployments"}`, `app validate --json`은 `POST /v1/apps/validate`의 응답 형식(`valid`, `spec`, `errors`)입니다. `app rm`은 응답 본문이 없어 아무것도 출력하지 않습니다.
+- `--json`이면 `app add`, `app branch add`, `deploy`는 API 응답을, `deploy watch`와 `--watch`는 메시지마다 `{"event", "id", "data"}` 한 줄을, `deploy logs`는 `log` 이벤트만 같은 형식으로 출력합니다. `app show --json`은 `{"app", "deployments"}`, `app branch list --json`은 인스턴스 배열(`deploy.instances`), `app validate --json`은 `POST /v1/apps/validate`의 응답 형식(`valid`, `spec`, `errors`)입니다. `app rm`, `app branch rm`은 응답 본문이 없어 아무것도 출력하지 않습니다.
 
 ```bash
 charlie app validate                                   # 레포 루트에서 platform.yaml 검사
@@ -131,6 +135,9 @@ charlie app show moimroom
 git push                                               # 이후 push마다 자동 배포
 charlie deploy moimroom --ref 9fceb02 --env eks --watch    # 특정 커밋을 한 환경에만
 charlie deploy logs dep_xxx --follow
+charlie app branch add moimroom dev --watch            # dev 브랜치를 moimroom--dev 인스턴스로 띄운다
+charlie deploy moimroom --branch dev --ref 9fceb02     # moimroom--dev에 특정 커밋을 배포
+charlie app branch rm moimroom dev
 ```
 
 ## 종료 코드

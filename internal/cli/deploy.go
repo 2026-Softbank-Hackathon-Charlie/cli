@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bufio"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -23,7 +24,7 @@ const appShowDeployments = 5
 
 func (g *globals) appCmd() *cobra.Command {
 	return group("app", "Register apps from GitHub, see how they run and check platform.yaml",
-		g.appAddCmd(), g.appListCmd(), g.appShowCmd(), g.appRmCmd(), g.appValidateCmd(), g.appReposCmd())
+		g.appAddCmd(), g.appListCmd(), g.appShowCmd(), g.appRmCmd(), g.appBranchCmd(), g.appValidateCmd(), g.appReposCmd())
 }
 
 func (g *globals) appAddCmd() *cobra.Command {
@@ -38,7 +39,8 @@ func (g *globals) appAddCmd() *cobra.Command {
 		Long: `Registers the app in a GitHub repository and queues its first deployment to
 every --env. The platform reads platform.yaml at the head of --branch through
 its GitHub App and names the app after the file's name. Every later push to
-the branch deploys again unless --no-auto-deploy is given.
+the branch deploys again unless --no-auto-deploy is given. More branches are
+deployed as instances of their own with "charlie app branch add".
 
 An invalid platform.yaml is refused with every broken rule and where it is;
 "charlie app validate" checks it first. With --watch, follows the first
@@ -95,7 +97,7 @@ deployment and exits 0 when it is healthy and 3 otherwise.`,
 	}
 	f := cmd.Flags()
 	f.StringVar(&repo, "repo", "", "OWNER/NAME of a repository the platform's GitHub App can see (required)")
-	f.StringVar(&branch, "branch", "main", "the branch platform.yaml is read from and pushes deploy from")
+	f.StringVar(&branch, "branch", "main", "the default branch: platform.yaml is read from it and its pushes deploy the app")
 	f.StringSliceVar(&envs, "env", nil, "environment to deploy to; repeat it or separate with commas (required)")
 	f.BoolVar(&noAuto, "no-auto-deploy", false, "deploy only when asked (charlie deploy), not on every push")
 	f.BoolVar(&watch, "watch", false, "watch the first deployment after registering")
@@ -109,21 +111,26 @@ func repoName(s string) bool {
 }
 
 func appOrigin(d *apiv1.AppDeploy) string {
-	auto := "on"
-	if !d.AutoDeploy {
-		auto = "off"
-	}
-	return fmt.Sprintf("%s (branch %s, auto deploy %s)", d.Repo, d.Branch, auto)
+	return fmt.Sprintf("%s (branch %s, auto deploy %s)", d.Repo, d.Branch, onOff(d.AutoDeploy))
 }
 
+func onOff(b bool) string {
+	if b {
+		return "on"
+	}
+	return "off"
+}
+
+// queuedLine names the instance the deployment goes to; servers from before
+// branch instances only name the app.
 func queuedLine(d *apiv1.Deployment) string {
-	return fmt.Sprintf("Queued deployment %s of %s at %s (%s) to %s.\n", d.Id, d.App, d.Ref, shortSHA(d.Commit), envNames(d.Environments))
+	return fmt.Sprintf("Queued deployment %s of %s at %s (%s) to %s.\n", d.Id, cmp.Or(d.Instance, d.App), d.Ref, shortSHA(d.Commit), envNames(d.Environments))
 }
 
 func (g *globals) appListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
-		Short: "List registered apps with their status per environment, and the apps file's apps",
+		Short: "List registered apps with their status per environment and number of instances, and the apps file's apps",
 		Args:  noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, err := g.client(cmd)
@@ -146,7 +153,7 @@ func (g *globals) appListCmd() *cobra.Command {
 func inAppsFile(a *apiv1.App) bool { return a.Deploy == nil || len(a.Environments) > 0 }
 
 func renderAppList(l *apiv1.AppList) string {
-	reg := [][]string{{"APP", "REPO", "BRANCH", "AUTO DEPLOY", "ENV", "STATUS", "COMMIT", "URL"}}
+	reg := [][]string{{"APP", "INSTANCES", "REPO", "BRANCH", "AUTO DEPLOY", "ENV", "STATUS", "COMMIT", "URL"}}
 	file := [][]string{{"APP", "NAMESPACE", "DATABASE", "ENVS"}}
 	for i := range l.Apps {
 		a := &l.Apps[i]
@@ -155,9 +162,13 @@ func renderAppList(l *apiv1.AppList) string {
 			if len(envs) == 0 {
 				envs = []string{""}
 			}
+			instances := ""
+			if n := len(d.Instances); n > 0 {
+				instances = fmt.Sprint(n)
+			}
 			for _, env := range envs {
-				st := appEnvStatus(d, env)
-				reg = append(reg, []string{a.Name, d.Repo, d.Branch, yesNo(d.AutoDeploy), env,
+				st := appEnvStatus(d.Status, env)
+				reg = append(reg, []string{a.Name, instances, d.Repo, d.Branch, yesNo(d.AutoDeploy), env,
 					envMark(st.Status) + " " + string(st.Status), shortSHA(str(st.Commit)), str(d.Url)})
 			}
 		}
@@ -185,9 +196,10 @@ func renderAppList(l *apiv1.AppList) string {
 	return b.String()
 }
 
-// appEnvStatus is the app's state in env; pending when the server has none.
-func appEnvStatus(d *apiv1.AppDeploy, env string) apiv1.AppEnvironmentStatus {
-	for _, s := range d.Status {
+// appEnvStatus is an app's or an instance's state in env; pending when the
+// server has none.
+func appEnvStatus(status []apiv1.AppEnvironmentStatus, env string) apiv1.AppEnvironmentStatus {
+	for _, s := range status {
 		if s.Env == env {
 			return s
 		}
@@ -204,7 +216,7 @@ type appDetail struct {
 func (g *globals) appShowCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "show NAME",
-		Short: "Show an app: where it comes from, its platform.yaml, its status and latest deployments",
+		Short: "Show an app: where it comes from, its platform.yaml, its status, instances and latest deployments",
 		Args:  exactArgs("NAME"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := g.client(cmd)
@@ -249,11 +261,14 @@ func renderAppDetail(d *appDetail, now time.Time) string {
 		out += fmt.Sprintf("\nplatform.yaml at %s: %s\n%s", shortSHA(dep.SpecCommit), specLine(&dep.Spec), specTable(&dep.Spec))
 		rows := [][]string{{"ENV", "STATUS", "SYNC", "HEALTH", "COMMIT", "URL", "UPDATED"}}
 		for _, env := range dep.Environments {
-			st := appEnvStatus(dep, env)
+			st := appEnvStatus(dep.Status, env)
 			rows = append(rows, []string{env, envMark(st.Status) + " " + string(st.Status), str(st.SyncStatus), str(st.HealthStatus),
 				shortSHA(str(st.Commit)), str(st.Url), stampPtr(st.UpdatedAt)})
 		}
 		out += "\n" + table(rows)
+		if len(dep.Instances) > 0 {
+			out += "\nInstances\n" + instanceTable(dep)
+		}
 		if len(d.Deployments) == 0 {
 			out += "\nNo deployments yet.\n"
 		} else {
@@ -315,11 +330,12 @@ func (g *globals) appRmCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rm NAME",
 		Short: "Unregister an app and delete everything it runs, data included (role operator)",
-		Long: `Unregisters an app registered from GitHub. The platform removes apps/NAME/ from
-the gitops repository, and Argo CD deletes the app's workloads in every
-environment together with its databases and buckets: the data cannot be
-recovered. Asks you to type the app's name unless --yes is given. An app that
-is only in the server's apps file cannot be removed.`,
+		Long: `Unregisters an app registered from GitHub. The platform removes apps/NAME/ and
+the apps/INSTANCE/ of every instance added with "charlie app branch add" from
+the gitops repository, and Argo CD deletes the workloads of every instance in
+every environment together with their databases and buckets: the data cannot
+be recovered. Asks you to type the app's name unless --yes is given. An app
+that is only in the server's apps file cannot be removed.`,
 		Args: exactArgs("NAME"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -337,8 +353,18 @@ is only in the server's apps file cannot be removed.`,
 				if a.Deploy == nil {
 					return fmt.Errorf("app %s is only in the server's apps file, not registered from GitHub; there is nothing to remove", name)
 				}
-				prompt := fmt.Sprintf("This deletes app %s from %s with its databases and buckets. The data cannot be recovered.\nType the app name to confirm: ",
-					name, strings.Join(a.Deploy.Environments, ", "))
+				var added []string
+				for _, in := range a.Deploy.Instances {
+					if !in.Default {
+						added = append(added, in.Name)
+					}
+				}
+				also := ""
+				if len(added) > 0 {
+					also = fmt.Sprintf(", together with its added %s %s", plural(len(added), "instance"), strings.Join(added, ", "))
+				}
+				prompt := fmt.Sprintf("This deletes app %s from %s with its databases and buckets%s. The data cannot be recovered.\nType the app name to confirm: ",
+					name, strings.Join(a.Deploy.Environments, ", "), also)
 				ok, err := g.confirm(prompt, name)
 				if err != nil {
 					return err
@@ -537,21 +563,27 @@ func renderRepos(l *apiv1.GitHubRepoList) string {
 
 func (g *globals) deployCmd() *cobra.Command {
 	var (
-		ref   string
-		envs  []string
-		watch bool
+		branch, ref string
+		envs        []string
+		watch       bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy APP",
 		Short: "Deploy a registered app now; list, show and follow its deployments",
-		Long: `Deploys the head of a registered app's branch, or --ref (a branch or a commit
-sha), to all its environments or to the --env ones (role operator). The
-platform builds one image per service, commits apps/APP/ENV.yaml to the gitops
-repository and Argo CD syncs it. With --watch, follows the deployment and exits
-0 when it is healthy and 3 when it failed or a newer deployment superseded it.`,
+		Long: `Deploys a registered app now, to all its environments or to the --env ones
+(role operator). --branch picks the instance: the app's own branch (the
+default) or a branch added with "charlie app branch add". --ref is the branch,
+tag or commit sha to deploy into that instance; by default the head of the
+branch. The platform builds one image per service, commits
+apps/<instance>/<env>.yaml to the gitops repository and Argo CD syncs it.
+With --watch, follows the deployment and exits 0 when it is healthy and 3 when
+it failed or a newer deployment of the instance superseded it.`,
 		Args: exactArgs("APP"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var req apiv1.DeploymentCreateRequest
+			if branch != "" {
+				req.Branch = &branch
+			}
 			if ref != "" {
 				req.Ref = &ref
 			}
@@ -588,7 +620,8 @@ repository and Argo CD syncs it. With --watch, follows the deployment and exits
 		},
 	}
 	f := cmd.Flags()
-	f.StringVar(&ref, "ref", "", "branch or commit sha to deploy (default: the app's branch)")
+	f.StringVar(&branch, "branch", "", "the instance to deploy, named by the branch it deploys (default: the app's branch)")
+	f.StringVar(&ref, "ref", "", "branch, tag or commit sha to deploy into that instance (default: the head of the branch)")
 	f.StringSliceVar(&envs, "env", nil, "deploy only to these of the app's environments; repeat it or separate with commas")
 	f.BoolVar(&watch, "watch", false, "watch the deployment after starting it")
 	cmd.AddCommand(g.deployListCmd(), g.deployShowCmd(), g.deployWatchCmd(), g.deployLogsCmd())
@@ -596,10 +629,13 @@ repository and Argo CD syncs it. With --watch, follows the deployment and exits
 }
 
 func (g *globals) deployListCmd() *cobra.Command {
-	var limit int
+	var (
+		limit  int
+		branch string
+	)
 	cmd := &cobra.Command{
 		Use:   "list APP",
-		Short: "List an app's deployments, newest first",
+		Short: "List an app's deployments to all its instances, or to one branch's, newest first",
 		Args:  exactArgs("APP"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("limit") && (limit < 1 || limit > 200) {
@@ -611,11 +647,14 @@ func (g *globals) deployListCmd() *cobra.Command {
 			}
 			ctx, cancel := callCtx(cmd)
 			defer cancel()
-			l, err := c.ListDeployments(ctx, args[0], limit)
+			l, err := c.ListBranchDeployments(ctx, args[0], branch, limit)
 			if err != nil {
 				return err
 			}
 			return show(g, l, func(l *apiv1.DeploymentList) string {
+				if len(l.Deployments) == 0 && branch != "" {
+					return "No deployments of " + args[0] + " branch " + branch + ".\n"
+				}
 				if len(l.Deployments) == 0 {
 					return "No deployments of " + args[0] + ".\n"
 				}
@@ -624,6 +663,7 @@ func (g *globals) deployListCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().IntVar(&limit, "limit", 0, "deployments to show, 1 to 200 (server default 20)")
+	cmd.Flags().StringVar(&branch, "branch", "", "only the deployments of this branch's instance")
 	return cmd
 }
 
@@ -653,10 +693,10 @@ func (g *globals) deployWatchCmd() *cobra.Command {
 		Use:   "watch ID",
 		Short: "Follow a deployment live until it ends",
 		Long: `Follows a deployment until it ends: its phase, each environment, the build and
-deploy log and the elapsed time, then the app's URL. A dropped connection is
-resumed without losing or repeating events. On a terminal the view redraws in
-place; otherwise it prints one line per event. Exits 0 when the deployment is
-healthy and 3 when it failed or was superseded.`,
+deploy log and the elapsed time, then the instance's URL. A dropped connection
+is resumed without losing or repeating events. On a terminal the view redraws
+in place; otherwise it prints one line per event. Exits 0 when the deployment
+is healthy and 3 when it failed or was superseded.`,
 		Args: exactArgs("ID"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := g.client(cmd)
@@ -693,14 +733,14 @@ deployment ends and then exits 0 when it is healthy and 3 otherwise.`,
 }
 
 func renderDeployments(ds []apiv1.Deployment, now time.Time) string {
-	rows := [][]string{{"DEPLOYMENT", "STATUS", "REF", "COMMIT", "TRIGGER", "BY", "ENVS", "CREATED", "DURATION"}}
+	rows := [][]string{{"DEPLOYMENT", "STATUS", "BRANCH", "REF", "COMMIT", "TRIGGER", "BY", "ENVS", "CREATED", "DURATION"}}
 	for i := range ds {
 		d := &ds[i]
 		envs := make([]string, len(d.Environments))
 		for j, e := range d.Environments {
 			envs[j] = envMark(e.Status) + " " + e.Env
 		}
-		rows = append(rows, []string{d.Id, deployMark(d.Status) + " " + string(d.Status), d.Ref, shortSHA(d.Commit),
+		rows = append(rows, []string{d.Id, deployMark(d.Status) + " " + string(d.Status), d.Branch, d.Ref, shortSHA(d.Commit),
 			string(d.Trigger), d.TriggeredBy, strings.Join(envs, ", "), stamp(d.CreatedAt), human(deployElapsed(d, now))})
 	}
 	return table(rows)
@@ -710,6 +750,8 @@ func renderDeployment(d *apiv1.Deployment, now time.Time) string {
 	out := fields([][2]string{
 		{"Deployment", d.Id},
 		{"App", d.App},
+		{"Branch", d.Branch},
+		{"Instance", d.Instance},
 		{"Status", deployMark(d.Status) + " " + string(d.Status)},
 		{"Ref", d.Ref},
 		{"Commit", d.Commit},
