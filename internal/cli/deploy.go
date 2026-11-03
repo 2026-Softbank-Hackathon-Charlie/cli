@@ -15,6 +15,7 @@ import (
 
 	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/apiv1"
 	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/appspec"
+	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/client"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -581,7 +582,7 @@ it failed or a newer deployment of the instance superseded it.`,
 		Args: exactArgs("APP"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var req apiv1.DeploymentCreateRequest
-			if branch != "" {
+			if cmd.Flags().Changed("branch") { // the server refuses an empty one
 				req.Branch = &branch
 			}
 			if ref != "" {
@@ -593,6 +594,9 @@ it failed or a newer deployment of the instance superseded it.`,
 			c, err := g.client(cmd)
 			if err != nil {
 				return err
+			}
+			if req.Branch == nil && ref != "" {
+				g.noteRefInstance(cmd, c, args[0], ref)
 			}
 			ctx, cancel := callCtx(cmd)
 			defer cancel()
@@ -626,6 +630,24 @@ it failed or a newer deployment of the instance superseded it.`,
 	f.BoolVar(&watch, "watch", false, "watch the deployment after starting it")
 	cmd.AddCommand(g.deployListCmd(), g.deployShowCmd(), g.deployWatchCmd(), g.deployLogsCmd())
 	return cmd
+}
+
+// noteRefInstance warns on stderr when ref is the branch of an added
+// instance: without --branch it is deployed into the default instance. It
+// says nothing when the app cannot be read.
+func (g *globals) noteRefInstance(cmd *cobra.Command, c *client.Client, app, ref string) {
+	ctx, cancel := callCtx(cmd)
+	defer cancel()
+	a, err := c.GetApp(ctx, app)
+	if err != nil || a.Deploy == nil {
+		return
+	}
+	for _, in := range a.Deploy.Instances {
+		if !in.Default && in.Branch == ref {
+			fmt.Fprintf(g.app.Stderr, "note: %s has its own instance %s; this deploys %s's head into the default instance %s. Use --branch %s to deploy that instance.\n",
+				ref, in.Name, ref, a.Name, ref)
+		}
+	}
 }
 
 func (g *globals) deployListCmd() *cobra.Command {

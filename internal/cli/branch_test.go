@@ -65,10 +65,10 @@ func TestAppBranchAddWatchFollowsTheFirstDeployment(t *testing.T) {
 		"Deployment dep_4  app moimroom  instance moimroom--feature-login (branch feature/login)  feature/login (4b825dc) to gke, eks: [ ] queued": 1,
 		clock(tsec(2)) + "  [ok] healthy\n": 1,
 		"Watch it with":                     0,
-		// The app does not list the new instance yet, so its own URL is
-		// unknown; the default instance's URL is not it.
-		"https://moimroom.hopcharlie.dev": 0,
-		"[ok] live at https://moimroom--feature-login-gke.hopcharlie.dev, https://moimroom--feature-login-eks.hopcharlie.dev\n": 1,
+		// The server stores the branch before it answers, so the app lists
+		// the new instance and its URL; the default instance's is not it.
+		"https://moimroom.hopcharlie.dev":                                 0,
+		"\n[ok] live at https://moimroom--feature-login.hopcharlie.dev\n": 1,
 	} {
 		if got := strings.Count(r.stdout, line); got != want {
 			t.Errorf("%q printed %d times, want %d\n%s", line, got, want, r.stdout)
@@ -76,6 +76,9 @@ func TestAppBranchAddWatchFollowsTheFirstDeployment(t *testing.T) {
 	}
 	if n := f.sent("GET", "/v1/deployments/dep_4/events"); n != 1 {
 		t.Errorf("event stream opened %d times", n)
+	}
+	if !strings.HasSuffix(r.stdout, "\n[ok] live at https://moimroom--feature-login.hopcharlie.dev\n") {
+		t.Errorf("the last line is not the new instance's URL:\n%s", r.stdout)
 	}
 }
 
@@ -162,6 +165,22 @@ func TestAppBranchRm(t *testing.T) {
 		t.Errorf("sent %d deletes of the default instance", n)
 	}
 
+	// A branch named like another instance: nothing is deleted, even with
+	// --yes and --json.
+	f.mu.Lock()
+	f.added = append(f.added, apiv1.AppInstance{Name: "moimroom--moimroom-dev", Branch: "moimroom--dev"})
+	f.mu.Unlock()
+	deletes := len(f.requests())
+	r = h.run("", "--json", "app", "branch", "rm", "moimroom", "moimroom--dev", "--yes")
+	if r.code != ExitError || r.stdout != "" || !strings.Contains(r.stderr, "nothing was deleted") {
+		t.Errorf("ambiguous: exit %d\nstdout %q\nstderr %q", r.code, r.stdout, r.stderr)
+	}
+	for _, req := range f.requests()[deletes:] {
+		if req.method == "DELETE" {
+			t.Errorf("ambiguous: sent %s %s", req.method, req.path)
+		}
+	}
+
 	if r := h.run("", "app", "branch", "rm", "moimroom", "nope", "-y"); r.code != ExitError ||
 		!strings.Contains(r.stderr, `app moimroom has no instance or branch "nope"; list them with: charlie app branch list moimroom`) {
 		t.Errorf("unknown instance: exit %d, stderr %q", r.code, r.stderr)
@@ -174,26 +193,55 @@ func TestAppBranchRm(t *testing.T) {
 	}
 }
 
-// An instance name wins over a branch of the same name.
-func TestFindInstance(t *testing.T) {
-	ins := []apiv1.AppInstance{
-		{Name: "moimroom", Branch: "main", Default: true},
-		{Name: "moimroom--moimroom-dev", Branch: "moimroom--dev"},
-		{Name: "moimroom--dev", Branch: "dev"},
-	}
-	for arg, want := range map[string]string{
-		"moimroom--dev": "moimroom--dev",
-		"dev":           "moimroom--dev",
-		"main":          "moimroom",
-		"moimroom":      "moimroom",
-		"nope":          "",
+// An argument that names one instance and is the branch of another is
+// refused with how to name each on its own; app rm is suggested only for
+// the default instance alone.
+func TestResolveInstance(t *testing.T) {
+	def := apiv1.AppInstance{Name: "moimroom", Branch: "main", Default: true}
+	dev := apiv1.AppInstance{Name: "moimroom--dev", Branch: "dev"}
+	const appRm = `instance moimroom deploys the app's own branch main; the default instance goes only with the app; use "charlie app rm moimroom"`
+	for _, tc := range []struct {
+		name    string
+		ins     []apiv1.AppInstance
+		arg     string
+		want    string // the instance found, or else the error
+		wantErr string
+	}{
+		{"by instance name", []apiv1.AppInstance{def, dev}, "moimroom--dev", "moimroom--dev", ""},
+		{"by branch", []apiv1.AppInstance{def, dev}, "dev", "moimroom--dev", ""},
+		{"default by name", []apiv1.AppInstance{def, dev}, "moimroom", "", appRm},
+		{"default by branch", []apiv1.AppInstance{def, dev}, "main", "", appRm},
+		{"unknown", []apiv1.AppInstance{def, dev}, "nope", "",
+			`app moimroom has no instance or branch "nope"; list them with: charlie app branch list moimroom`},
+
+		// The branch moimroom--dev deploys the instance moimroom--moimroom-dev.
+		{"name of one, branch of another", []apiv1.AppInstance{def, dev, {Name: "moimroom--moimroom-dev", Branch: "moimroom--dev"}}, "moimroom--dev", "",
+			`"moimroom--dev" is instance moimroom--dev (branch dev) and the branch of instance moimroom--moimroom-dev; nothing was deleted` +
+				"; to remove moimroom--dev, name it by its branch: charlie app branch rm moimroom dev" +
+				"; to remove moimroom--moimroom-dev, name it by its instance name: charlie app branch rm moimroom moimroom--moimroom-dev"},
+		{"its branch is not ambiguous", []apiv1.AppInstance{def, dev, {Name: "moimroom--moimroom-dev", Branch: "moimroom--dev"}}, "dev", "moimroom--dev", ""},
+
+		// The branch moimroom deploys the instance moimroom--moimroom: no app rm.
+		{"default name, added branch", []apiv1.AppInstance{def, {Name: "moimroom--moimroom", Branch: "moimroom"}}, "moimroom", "",
+			`"moimroom" is the default instance moimroom (branch main) and the branch of instance moimroom--moimroom; nothing was deleted` +
+				"; to remove moimroom--moimroom, name it by its instance name: charlie app branch rm moimroom moimroom--moimroom"},
+		{"default by its branch still", []apiv1.AppInstance{def, {Name: "moimroom--moimroom", Branch: "moimroom"}}, "main", "", appRm},
+
+		// moimroom--moimroom is ambiguous by its name and by its branch.
+		{"both ways ambiguous", []apiv1.AppInstance{def, {Name: "moimroom--moimroom", Branch: "moimroom"}, {Name: "moimroom--moimroom-moimroom", Branch: "moimroom--moimroom"}}, "moimroom--moimroom", "",
+			`"moimroom--moimroom" is instance moimroom--moimroom (branch moimroom) and the branch of instance moimroom--moimroom-moimroom; nothing was deleted` +
+				"; to remove moimroom--moimroom, use the console or the API (DELETE /v1/apps/moimroom/instances/moimroom--moimroom)" +
+				"; to remove moimroom--moimroom-moimroom, name it by its instance name: charlie app branch rm moimroom moimroom--moimroom-moimroom"},
+		{"both ways ambiguous, by the default's name", []apiv1.AppInstance{def, {Name: "moimroom--moimroom", Branch: "moimroom"}, {Name: "moimroom--moimroom-moimroom", Branch: "moimroom--moimroom"}}, "moimroom", "",
+			`"moimroom" is the default instance moimroom (branch main) and the branch of instance moimroom--moimroom; nothing was deleted` +
+				"; to remove moimroom--moimroom, use the console or the API (DELETE /v1/apps/moimroom/instances/moimroom--moimroom)"},
 	} {
-		got := ""
-		if in := findInstance(ins, arg); in != nil {
-			got = in.Name
-		}
-		if got != want {
-			t.Errorf("findInstance(%q) = %q, want %q", arg, got, want)
+		in, err := resolveInstance("moimroom", tc.ins, tc.arg)
+		switch {
+		case tc.wantErr != "" && (err == nil || err.Error() != tc.wantErr):
+			t.Errorf("%s: error %v\nwant %s", tc.name, err, tc.wantErr)
+		case tc.wantErr == "" && (err != nil || in.Name != tc.want):
+			t.Errorf("%s: %+v, %v; want %s", tc.name, in, err, tc.want)
 		}
 	}
 }
@@ -213,8 +261,41 @@ func TestDeployBranch(t *testing.T) {
 	if body := string(f.last(t, "POST", "/v1/apps/moimroom/deployments").body); body != `{"branch":"dev","environments":["eks"],"ref":"v1.2"}` {
 		t.Errorf("body %s", body)
 	}
-	if r := h.run("", "deploy", "moimroom", "--branch", "nope"); r.code != ExitError || !strings.Contains(r.stderr, "invalid_request: app moimroom does not deploy branch nope") {
+	if r := h.run("", "deploy", "moimroom", "--branch", "nope"); r.code != ExitError || !strings.Contains(r.stderr, `invalid_request: app moimroom does not deploy branch "nope"`) {
 		t.Errorf("unknown branch: exit %d, stderr %q", r.code, r.stderr)
+	}
+	// An empty --branch goes to the server, which refuses it, rather than
+	// deploying the default instance.
+	r = h.run("", "deploy", "moimroom", "--branch", "")
+	if body := string(f.last(t, "POST", "/v1/apps/moimroom/deployments").body); body != `{"branch":""}` || r.code != ExitError ||
+		!strings.Contains(r.stderr, `does not deploy branch ""`) {
+		t.Errorf("empty branch: body %s, exit %d, stderr %q", body, r.code, r.stderr)
+	}
+
+	// --ref naming an added instance's branch still deploys the default
+	// instance, with a note.
+	r = h.run("", "deploy", "moimroom", "--ref", "dev").ok(t)
+	if body := string(f.last(t, "POST", "/v1/apps/moimroom/deployments").body); body != `{"ref":"dev"}` {
+		t.Errorf("body %s", body)
+	}
+	if want := "note: dev has its own instance moimroom--dev; this deploys dev's head into the default instance moimroom. Use --branch dev to deploy that instance.\n"; r.stderr != want {
+		t.Errorf("stderr %q, want %q", r.stderr, want)
+	}
+	if !strings.Contains(r.stdout, "Queued deployment dep_2 of moimroom at dev (9fceb02)") {
+		t.Errorf("stdout:\n%s", r.stdout)
+	}
+	gets := f.sent("GET", "/v1/apps/moimroom")
+	for _, args := range [][]string{
+		{"deploy", "moimroom", "--ref", "main"},
+		{"deploy", "moimroom", "--branch", "dev", "--ref", "dev"},
+		{"deploy", "nope", "--ref", "dev"}, // the app cannot be read: no note
+	} {
+		if r := h.run("", args...).ok(t); r.stderr != "" {
+			t.Errorf("%v: stderr %q", args, r.stderr)
+		}
+	}
+	if n := f.sent("GET", "/v1/apps/moimroom") - gets; n != 1 {
+		t.Errorf("read the app %d times for --ref without --branch, want 1", n)
 	}
 
 	out := h.run("", "deploy", "list", "moimroom", "--branch", "dev", "--limit", "5").ok(t).stdout
@@ -278,7 +359,9 @@ func TestInstanceURL(t *testing.T) {
 			t.Errorf("%s: %q, want %q", tc.name, got, tc.want)
 		}
 	}
-	if got := deployTarget(&oldDep); got != "app moimroom" {
-		t.Errorf("old server's deployment target %q", got)
+	for _, d := range []apiv1.Deployment{oldDep, fixtureDeployment("dep_1", apiv1.DeploymentStatusHealthy)} {
+		if got := deployTarget(&d); got != "app moimroom" {
+			t.Errorf("deployment target of instance %q: %q", d.Instance, got)
+		}
 	}
 }

@@ -239,11 +239,12 @@ func deployEnd(ctx context.Context, err error, d *apiv1.Deployment, id, reattach
 	return &exitError{code: ExitRunFailed, msg: msg}
 }
 
-// deployTarget names the app and, from servers with branch instances, the
-// instance a deployment goes to and its branch.
+// deployTarget names the app and, for an added instance, the instance a
+// deployment goes to and its branch. The default instance is named after the
+// app, and servers from before branch instances name none.
 func deployTarget(d *apiv1.Deployment) string {
 	s := "app " + d.App
-	if d.Instance != "" {
+	if d.Instance != "" && d.Instance != d.App {
 		s += fmt.Sprintf("  instance %s (branch %s)", d.Instance, d.Branch)
 	}
 	return s

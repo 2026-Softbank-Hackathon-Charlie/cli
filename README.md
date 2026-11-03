@@ -113,7 +113,9 @@ charlie migrate switch <run id>
 | `deploy watch ID` | 단계, 환경별 상태, 빌드와 배포 로그, 경과 시간을 실시간으로 표시하고, 끝나면 배포한 인스턴스의 URL을 보여 준다 |
 | `deploy logs ID [--follow]` | 빌드와 배포 로그. `--follow`면 배포가 끝날 때까지 계속 출력한다 |
 
-- 앱 하나에 기본 브랜치 말고 다른 브랜치를 인스턴스로 더 띄울 수 있습니다(platform 레포 `docs/adr/0015-branch-instances.md`). 기본 인스턴스 이름은 앱 이름이고, 추가한 브랜치의 인스턴스는 `<app>--<브랜치 슬러그>`이며 URL은 `https://<instance>.hopcharlie.dev`입니다. 인스턴스마다 네임스페이스, DB, 버킷이 따로 생기고, gitops 경로는 `apps/<instance>/<env>.yaml`입니다. 앱 하나에 인스턴스는 기본 인스턴스를 포함해 3개까지입니다. 이미 추적하는 브랜치는 409 `branch_exists`, 슬러그가 같은 브랜치는 409 `instance_exists`, 3개를 넘기면 409 `instance_limit`로 끝납니다.
+- 앱 하나에 기본 브랜치 말고 다른 브랜치를 인스턴스로 더 띄울 수 있습니다(platform 레포 `docs/adr/0015-branch-instances.md`). 기본 인스턴스 이름은 앱 이름이고, 추가한 브랜치의 인스턴스는 `<app>--<브랜치 슬러그>`이며 URL은 `https://<instance>.hopcharlie.dev`입니다. 슬러그는 브랜치 이름을 소문자로 바꾸고, `a-z`, `0-9`가 아닌 글자가 이어진 곳을 `-` 하나로 바꾸고, 앞뒤의 `-`를 뗀 것입니다. 인스턴스 이름이 53자를 넘으면 슬러그를 잘라 끝에 `-<16진수 6자>`(브랜치 이름의 SHA-256 앞 6자)를 붙입니다. 인스턴스마다 네임스페이스, DB, 버킷이 따로 생기고, gitops 경로는 `apps/<instance>/<env>.yaml`입니다. 앱 하나에 인스턴스는 기본 인스턴스를 포함해 3개까지입니다. 이미 추적하는 브랜치는 409 `branch_exists`, 슬러그가 같은 브랜치는 409 `instance_exists`, 3개를 넘기면 409 `instance_limit`로 끝납니다.
+- 추가한 인스턴스는 지금 eks 환경에서만 돌 수 있습니다. GKE의 Argo CD가 `charlie-apps` 네임스페이스만 관리하기 때문입니다. 브랜치를 추가할 앱은 eks 환경으로 등록합니다(`app add --env eks`).
+- `app branch rm`의 인자가 한 인스턴스의 이름이면서 다른 인스턴스의 브랜치이면 아무것도 지우지 않고, 각 인스턴스를 헷갈리지 않게 가리키는 방법을 알려 줍니다. `--ref`에 추가한 인스턴스의 브랜치를 주고 `--branch`를 주지 않으면 기본 인스턴스에 배포하므로, `deploy`가 표준 오류에 그 사실을 알려 줍니다.
 - `platform.yaml`이 규칙을 어기면 `app add`, `app branch add`, `deploy`는 422로 끝나고, 어긴 규칙을 경로와 함께 한 줄씩 표준 오류로 출력합니다. `app validate`는 같은 형식으로 표준 출력에 쓰고, 유효하면 0, 아니면 1로 끝납니다.
 
   ```

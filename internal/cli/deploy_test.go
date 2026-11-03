@@ -35,6 +35,17 @@ type deployFake struct {
 	reqs   []fakeReq
 	events func(w http.ResponseWriter, r *http.Request, conn int)
 	conns  int
+	added  []apiv1.AppInstance // instances of moimroom added since the fixture
+}
+
+// registeredApp is moimroom as the server lists it now: the fixture and the
+// instances added since.
+func (f *deployFake) registeredApp() apiv1.App {
+	a := fixtureRegisteredApp()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a.Deploy.Instances = append(a.Deploy.Instances, f.added...)
+	return a
 }
 
 func newDeployFake(t *testing.T) *deployFake {
@@ -42,12 +53,12 @@ func newDeployFake(t *testing.T) *deployFake {
 	f := &deployFake{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/apps", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, apiv1.AppList{Apps: []apiv1.App{fixtureFileApp(), fixtureRegisteredApp()}})
+		writeJSON(w, 200, apiv1.AppList{Apps: []apiv1.App{fixtureFileApp(), f.registeredApp()}})
 	})
 	mux.HandleFunc("GET /v1/apps/{name}", func(w http.ResponseWriter, r *http.Request) {
 		switch r.PathValue("name") {
 		case "moimroom":
-			writeJSON(w, 200, fixtureRegisteredApp())
+			writeJSON(w, 200, f.registeredApp())
 		case "shop":
 			writeJSON(w, 200, fixtureFileApp())
 		default:
@@ -98,16 +109,28 @@ func newDeployFake(t *testing.T) *deployFake {
 			d := fixtureInstanceDeployment("dep_4", req.Branch, apiv1.DeploymentStatusQueued)
 			in := apiv1.AppInstance{Name: d.Instance, Branch: req.Branch, AutoDeploy: req.AutoDeploy == nil || *req.AutoDeploy,
 				Spec: fixtureSpec(), SpecCommit: devSHA, Url: ptr("https://" + d.Instance + ".hopcharlie.dev"), CreatedAt: t0, CreatedBy: "alice",
-				Status: []apiv1.AppEnvironmentStatus{}}
+				Status: []apiv1.AppEnvironmentStatus{
+					{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusPending},
+					{Env: "eks", Status: apiv1.DeploymentEnvironmentStatusPending},
+				}}
+			// The branch is stored before the answer, so the app lists the
+			// instance from now on.
+			f.mu.Lock()
+			f.added = append(f.added, in)
+			f.mu.Unlock()
 			w.Header().Set("Location", "/v1/apps/moimroom")
 			writeJSON(w, 201, apiv1.AppInstanceCreated{Instance: in, Deployment: d})
 		}
 	})
 	mux.HandleFunc("DELETE /v1/apps/{name}/instances/{instance}", func(w http.ResponseWriter, r *http.Request) {
-		switch r.PathValue("instance") {
-		case "moimroom--dev":
+		switch name, instance := r.PathValue("name"), r.PathValue("instance"); {
+		case name == "shop":
+			writeError(w, 409, "app_not_registered", "app shop is only in PLATFORM_APPS_FILE")
+		case name != "moimroom":
+			writeError(w, 404, "app_not_found", "app not found")
+		case instance == "moimroom--dev":
 			w.WriteHeader(202)
-		case "moimroom":
+		case instance == "moimroom":
 			writeError(w, 409, "default_instance", "the default instance goes only with the app")
 		default:
 			writeError(w, 404, "instance_not_found", "instance not found")
@@ -130,12 +153,12 @@ func newDeployFake(t *testing.T) *deployFake {
 			return
 		}
 		d := fixtureDeployment("dep_2", apiv1.DeploymentStatusQueued)
-		switch b := str(req.Branch); b {
-		case "", "main":
-		case "dev":
-			d = fixtureInstanceDeployment("dep_2", b, apiv1.DeploymentStatusQueued)
+		switch {
+		case req.Branch == nil || *req.Branch == "main":
+		case *req.Branch == "dev":
+			d = fixtureInstanceDeployment("dep_2", "dev", apiv1.DeploymentStatusQueued)
 		default:
-			writeError(w, 400, "invalid_request", "app moimroom does not deploy branch "+b)
+			writeError(w, 400, "invalid_request", fmt.Sprintf("app moimroom does not deploy branch %q", *req.Branch))
 			return
 		}
 		d.Trigger = apiv1.DeploymentTriggerManual
@@ -323,10 +346,12 @@ func fixtureRegisteredApp() apiv1.App {
 			Instances: []apiv1.AppInstance{
 				{Name: "moimroom", Branch: "main", Default: true, AutoDeploy: true, Spec: fixtureSpec(), SpecCommit: testSHA, Url: url,
 					CreatedAt: t0, CreatedBy: "alice", LastDeployment: &last, Status: status},
-				// eks has no entry yet: pending.
 				{Name: "moimroom--dev", Branch: "dev", AutoDeploy: false, Spec: fixtureSpec(), SpecCommit: devSHA, Url: ptr("https://moimroom--dev.hopcharlie.dev"),
 					CreatedAt: t0.Add(time.Hour), CreatedBy: "bob", LastDeployment: &devLast,
-					Status: []apiv1.AppEnvironmentStatus{{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusHealthy, Commit: ptr(devSHA)}}},
+					Status: []apiv1.AppEnvironmentStatus{
+						{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusHealthy, Commit: ptr(devSHA)},
+						{Env: "eks", Status: apiv1.DeploymentEnvironmentStatusPending},
+					}},
 			}}}
 }
 
@@ -452,7 +477,7 @@ func TestAppAddWatchFollowsTheFirstDeployment(t *testing.T) {
 	r := f.harness(t).run("", "app", "add", "--repo", "org/moimroom", "--env", "gke,eks", "--watch").ok(t)
 	for line, want := range map[string]int{
 		"Registered app moimroom": 1,
-		"Deployment dep_1  app moimroom  instance moimroom (branch main)  main (9fceb02) to gke, eks: [ ] queued": 1,
+		"Deployment dep_1  app moimroom  main (9fceb02) to gke, eks: [ ] queued":               1,
 		clock(tsec(1)) + "  [..] building\n":                                                   1,
 		clock(tsec(2)) + "  building  #1 [internal] load build definition from Dockerfile\n":   1,
 		clock(tsec(3)) + "  building  #2 DONE 0.4s\n":                                          1,
@@ -1046,7 +1071,7 @@ func TestDeployFrame(t *testing.T) {
 	now := t0.Add(65 * time.Second)
 	out := v.frame(now, 0, 0)
 	for _, want := range []string{
-		"Deployment dep_1  app moimroom  instance moimroom (branch main)  main (9fceb02)  register by alice",
+		"Deployment dep_1  app moimroom  main (9fceb02)  register by alice",
 		"Status [..] syncing  elapsed 1m05s",
 		"Phases [ok] queued  [ok] building  [ok] committing  [..] syncing",
 		"eks  [ ] pending",

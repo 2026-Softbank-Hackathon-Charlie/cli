@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"cmp"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -20,12 +22,16 @@ func (g *globals) appBranchAddCmd() *cobra.Command {
 		Use:   "add APP BRANCH",
 		Short: "Deploy another branch of an app as an instance of its own (role operator)",
 		Long: `Deploys BRANCH of a registered app's repository as an instance of its own,
-named APP--<branch slug>, with its own namespace, databases, buckets and URL
-https://APP--<branch slug>.<domain>, and queues its first deployment to every
-environment of the app. The platform reads platform.yaml at the head of BRANCH
-and checks it as at registration; its name must be the app's. Every later push
-to BRANCH deploys the instance again unless --no-auto-deploy is given. An app
-has at most 3 instances, the default one (the app's own branch) included.
+named APP--<branch slug>. The slug is the branch in lowercase, with every run
+of characters other than a-z and 0-9 turned into one "-" and none at either
+end; a name longer than 53 characters keeps as much of the slug as fits and
+ends in -<6 hex digits> of the branch's SHA-256. The instance has its own
+namespace, databases, buckets and URL https://<instance>.<domain>, and its
+first deployment is queued to every environment of the app. The platform
+reads platform.yaml at the head of BRANCH and checks it as at registration;
+its name must be the app's. Every later push to BRANCH deploys the instance
+again unless --no-auto-deploy is given. An app has at most 3 instances, the
+default one (the app's own branch) included.
 
 With --watch, follows the first deployment and exits 0 when it is healthy and
 3 otherwise.`,
@@ -138,12 +144,9 @@ app's own branch, goes only with the app ("charlie app rm").`,
 			if a.Deploy == nil {
 				return notRegistered(name)
 			}
-			in := findInstance(a.Deploy.Instances, args[1])
-			if in == nil {
-				return fmt.Errorf("app %s has no instance or branch %q; list them with: charlie app branch list %s", name, args[1], name)
-			}
-			if in.Default {
-				return fmt.Errorf(`instance %s deploys the app's own branch %s; the default instance goes only with the app; use "charlie app rm %s"`, in.Name, in.Branch, name)
+			in, err := resolveInstance(name, a.Deploy.Instances, args[1])
+			if err != nil {
+				return err
 			}
 			if !yes {
 				prompt := fmt.Sprintf("This deletes instance %s (branch %s) of app %s from %s with its databases and buckets. The data cannot be recovered.\nType the instance name to confirm: ",
@@ -175,19 +178,59 @@ func notRegistered(app string) error {
 	return fmt.Errorf("app %s is only in the server's apps file, not registered from GitHub; it has no instances", app)
 }
 
-// findInstance finds an app's instance by its name, else by its branch.
-func findInstance(ins []apiv1.AppInstance, arg string) *apiv1.AppInstance {
+// resolveInstance finds the added instance of app that arg names, by its
+// instance name or by its branch. It refuses an arg that names one instance
+// and is the branch of another, and the default instance, which goes only
+// with the app.
+func resolveInstance(app string, ins []apiv1.AppInstance, arg string) (*apiv1.AppInstance, error) {
+	byName, byBranch := instanceMatches(ins, arg)
+	switch {
+	case byName == nil && byBranch == nil:
+		return nil, fmt.Errorf("app %s has no instance or branch %q; list them with: charlie app branch list %s", app, arg, app)
+	case byName != nil && byBranch != nil && byName != byBranch:
+		return nil, ambiguousInstance(app, ins, arg, byName, byBranch)
+	}
+	in := cmp.Or(byName, byBranch)
+	if in.Default {
+		return nil, fmt.Errorf(`instance %s deploys the app's own branch %s; the default instance goes only with the app; use "charlie app rm %s"`, in.Name, in.Branch, app)
+	}
+	return in, nil
+}
+
+// instanceMatches returns the instance named arg and the instance that
+// deploys branch arg; either may be nil.
+func instanceMatches(ins []apiv1.AppInstance, arg string) (byName, byBranch *apiv1.AppInstance) {
 	for i := range ins {
 		if ins[i].Name == arg {
-			return &ins[i]
+			byName = &ins[i]
 		}
-	}
-	for i := range ins {
 		if ins[i].Branch == arg {
-			return &ins[i]
+			byBranch = &ins[i]
 		}
 	}
-	return nil
+	return byName, byBranch
+}
+
+// ambiguousInstance says that arg names one instance and is the branch of
+// another, and how to name each added one on its own: the instance named arg
+// by its branch, the other by its instance name. When that is ambiguous too,
+// only the console or the API can pick it.
+func ambiguousInstance(app string, ins []apiv1.AppInstance, arg string, byName, byBranch *apiv1.AppInstance) error {
+	named := "instance " + byName.Name
+	if byName.Default {
+		named = "the default instance " + byName.Name
+	}
+	msg := fmt.Sprintf("%q is %s (branch %s) and the branch of instance %s; nothing was deleted", arg, named, byName.Branch, byBranch.Name)
+	way := func(in *apiv1.AppInstance, by, what string) string {
+		if n, b := instanceMatches(ins, by); n == nil || b == nil || n == b {
+			return fmt.Sprintf("; to remove %s, name it by its %s: charlie app branch rm %s %s", in.Name, what, app, by)
+		}
+		return fmt.Sprintf("; to remove %s, use the console or the API (DELETE /v1/apps/%s/instances/%s)", in.Name, app, in.Name)
+	}
+	if !byName.Default {
+		msg += way(byName, byName.Branch, "branch")
+	}
+	return errors.New(msg + way(byBranch, byBranch.Name, "instance name"))
 }
 
 // instanceTable lists an app's instances, one row each. STATUS marks every
