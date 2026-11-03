@@ -38,7 +38,7 @@ type deployView struct {
 	have   bool
 	last   apiv1.DeploymentStatus // the latest phase before the end, where a failure happened
 	recent []string
-	url    string // the app's public URL, read once the deployment is healthy
+	url    string // the instance's public URL, read once the deployment is healthy
 }
 
 func (v *deployView) apply(m client.DeploymentMessage) {
@@ -147,7 +147,8 @@ func phaseLine(status, last apiv1.DeploymentStatus) string {
 	return strings.Join(parts, "  ")
 }
 
-// liveURL is where the app answers: its public URL, else the environments'.
+// liveURL is where the instance answers: its public URL, else the
+// environments'.
 func (v *deployView) liveURL() string {
 	if v.url != "" {
 		return v.url
@@ -166,7 +167,7 @@ func (v *deployView) liveURL() string {
 func (v *deployView) frame(now time.Time, width, maxLines int) string {
 	d := &v.dep
 	var b strings.Builder
-	fmt.Fprintf(&b, "Deployment %s  app %s  %s (%s)  %s by %s\n", d.Id, d.App, d.Ref, shortSHA(d.Commit), d.Trigger, d.TriggeredBy)
+	fmt.Fprintf(&b, "Deployment %s  %s  %s (%s)  %s by %s\n", d.Id, deployTarget(d), d.Ref, shortSHA(d.Commit), d.Trigger, d.TriggeredBy)
 	fmt.Fprintf(&b, "Status %s %s  elapsed %s  created %s\n", deployMark(d.Status), d.Status, human(deployElapsed(d, now)), stamp(d.CreatedAt))
 	fmt.Fprintf(&b, "Phases %s\n", phaseLine(d.Status, v.last))
 	if e := str(d.Error); e != "" {
@@ -238,8 +239,19 @@ func deployEnd(ctx context.Context, err error, d *apiv1.Deployment, id, reattach
 	return &exitError{code: ExitRunFailed, msg: msg}
 }
 
-// readURL reads the app's public URL once the deployment is healthy; the
-// deployment itself knows only the environments' URLs.
+// deployTarget names the app and, for an added instance, the instance a
+// deployment goes to and its branch. The default instance is named after the
+// app, and servers from before branch instances name none.
+func deployTarget(d *apiv1.Deployment) string {
+	s := "app " + d.App
+	if d.Instance != "" && d.Instance != d.App {
+		s += fmt.Sprintf("  instance %s (branch %s)", d.Instance, d.Branch)
+	}
+	return s
+}
+
+// readURL reads the instance's public URL once the deployment is healthy;
+// the deployment itself knows only the environments' URLs.
 func (g *globals) readURL(cmd *cobra.Command, c *client.Client, v *deployView) {
 	if v.dep.Status != apiv1.DeploymentStatusHealthy {
 		return
@@ -247,8 +259,23 @@ func (g *globals) readURL(cmd *cobra.Command, c *client.Client, v *deployView) {
 	ctx, cancel := callCtx(cmd)
 	defer cancel()
 	if a, err := c.GetApp(ctx, v.dep.App); err == nil && a.Deploy != nil {
-		v.url = str(a.Deploy.Url)
+		v.url = instanceURL(a.Deploy, &v.dep)
 	}
+}
+
+// instanceURL is the public URL of the instance d deploys. A server from
+// before branch instances lists none and names no instance; its app URL is
+// the one.
+func instanceURL(a *apiv1.AppDeploy, d *apiv1.Deployment) string {
+	for _, in := range a.Instances {
+		if in.Name == d.Instance {
+			return str(in.Url)
+		}
+	}
+	if d.Instance == "" || d.Instance == d.App {
+		return str(a.Url)
+	}
+	return ""
 }
 
 // watchDeployScreen redraws the full view on every message and once a second.
@@ -316,7 +343,7 @@ func (g *globals) watchDeployLines(cmd *cobra.Command, c *client.Client, id stri
 		var line string
 		switch {
 		case m.Snapshot != nil && first:
-			line = fmt.Sprintf("Deployment %s  app %s  %s (%s) to %s: %s %s\n", d.Id, d.App, d.Ref, shortSHA(d.Commit), envNames(d.Environments), deployMark(d.Status), d.Status)
+			line = fmt.Sprintf("Deployment %s  %s  %s (%s) to %s: %s %s\n", d.Id, deployTarget(d), d.Ref, shortSHA(d.Commit), envNames(d.Environments), deployMark(d.Status), d.Status)
 			first = false
 		case m.Snapshot != nil:
 			line = fmt.Sprintf("%s  snapshot: %s %s\n", clock(time.Now()), deployMark(d.Status), d.Status)

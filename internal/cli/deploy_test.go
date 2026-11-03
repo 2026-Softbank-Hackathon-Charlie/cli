@@ -20,11 +20,14 @@ import (
 	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/client"
 )
 
-const testSHA = "9fceb02d0ae598e95dc970b74767f19372d61af8"
+const (
+	testSHA = "9fceb02d0ae598e95dc970b74767f19372d61af8"
+	devSHA  = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+)
 
 // deployFake serves the app and deployment routes of api/openapi.yaml: the
-// registered app moimroom, the apps file's app shop, and the SSE contract
-// on the deployment events route.
+// registered app moimroom with its added instance moimroom--dev, the apps
+// file's app shop, and the SSE contract on the deployment events route.
 type deployFake struct {
 	*httptest.Server
 
@@ -32,6 +35,17 @@ type deployFake struct {
 	reqs   []fakeReq
 	events func(w http.ResponseWriter, r *http.Request, conn int)
 	conns  int
+	added  []apiv1.AppInstance // instances of moimroom added since the fixture
+}
+
+// registeredApp is moimroom as the server lists it now: the fixture and the
+// instances added since.
+func (f *deployFake) registeredApp() apiv1.App {
+	a := fixtureRegisteredApp()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a.Deploy.Instances = append(a.Deploy.Instances, f.added...)
+	return a
 }
 
 func newDeployFake(t *testing.T) *deployFake {
@@ -39,12 +53,12 @@ func newDeployFake(t *testing.T) *deployFake {
 	f := &deployFake{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/apps", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, apiv1.AppList{Apps: []apiv1.App{fixtureFileApp(), fixtureRegisteredApp()}})
+		writeJSON(w, 200, apiv1.AppList{Apps: []apiv1.App{fixtureFileApp(), f.registeredApp()}})
 	})
 	mux.HandleFunc("GET /v1/apps/{name}", func(w http.ResponseWriter, r *http.Request) {
 		switch r.PathValue("name") {
 		case "moimroom":
-			writeJSON(w, 200, fixtureRegisteredApp())
+			writeJSON(w, 200, f.registeredApp())
 		case "shop":
 			writeJSON(w, 200, fixtureFileApp())
 		default:
@@ -79,6 +93,49 @@ func newDeployFake(t *testing.T) *deployFake {
 			writeError(w, 404, "app_not_found", "app not found")
 		}
 	})
+	mux.HandleFunc("POST /v1/apps/{name}/instances", func(w http.ResponseWriter, r *http.Request) {
+		var req apiv1.AppInstanceCreateRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		switch {
+		case r.PathValue("name") == "shop":
+			writeError(w, 409, "app_not_registered", "app shop is only in PLATFORM_APPS_FILE")
+		case r.PathValue("name") != "moimroom":
+			writeError(w, 404, "app_not_found", "app not found")
+		case req.Branch == "broken":
+			writeSpecInvalid(w)
+		case req.Branch == "main" || req.Branch == "dev":
+			writeError(w, 409, "branch_exists", "app moimroom already deploys branch "+req.Branch)
+		default:
+			d := fixtureInstanceDeployment("dep_4", req.Branch, apiv1.DeploymentStatusQueued)
+			in := apiv1.AppInstance{Name: d.Instance, Branch: req.Branch, AutoDeploy: req.AutoDeploy == nil || *req.AutoDeploy,
+				Spec: fixtureSpec(), SpecCommit: devSHA, Url: ptr("https://" + d.Instance + ".hopcharlie.dev"), CreatedAt: t0, CreatedBy: "alice",
+				Status: []apiv1.AppEnvironmentStatus{
+					{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusPending},
+					{Env: "eks", Status: apiv1.DeploymentEnvironmentStatusPending},
+				}}
+			// The branch is stored before the answer, so the app lists the
+			// instance from now on.
+			f.mu.Lock()
+			f.added = append(f.added, in)
+			f.mu.Unlock()
+			w.Header().Set("Location", "/v1/apps/moimroom")
+			writeJSON(w, 201, apiv1.AppInstanceCreated{Instance: in, Deployment: d})
+		}
+	})
+	mux.HandleFunc("DELETE /v1/apps/{name}/instances/{instance}", func(w http.ResponseWriter, r *http.Request) {
+		switch name, instance := r.PathValue("name"), r.PathValue("instance"); {
+		case name == "shop":
+			writeError(w, 409, "app_not_registered", "app shop is only in PLATFORM_APPS_FILE")
+		case name != "moimroom":
+			writeError(w, 404, "app_not_found", "app not found")
+		case instance == "moimroom--dev":
+			w.WriteHeader(202)
+		case instance == "moimroom":
+			writeError(w, 409, "default_instance", "the default instance goes only with the app")
+		default:
+			writeError(w, 404, "instance_not_found", "instance not found")
+		}
+	})
 	mux.HandleFunc("POST /v1/apps/validate", func(w http.ResponseWriter, r *http.Request) {
 		var req apiv1.AppSpecValidateRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
@@ -96,6 +153,14 @@ func newDeployFake(t *testing.T) *deployFake {
 			return
 		}
 		d := fixtureDeployment("dep_2", apiv1.DeploymentStatusQueued)
+		switch {
+		case req.Branch == nil || *req.Branch == "main":
+		case *req.Branch == "dev":
+			d = fixtureInstanceDeployment("dep_2", "dev", apiv1.DeploymentStatusQueued)
+		default:
+			writeError(w, 400, "invalid_request", fmt.Sprintf("app moimroom does not deploy branch %q", *req.Branch))
+			return
+		}
 		d.Trigger = apiv1.DeploymentTriggerManual
 		if req.Ref != nil {
 			d.Ref = *req.Ref
@@ -109,6 +174,15 @@ func newDeployFake(t *testing.T) *deployFake {
 	mux.HandleFunc("GET /v1/apps/{name}/deployments", func(w http.ResponseWriter, r *http.Request) {
 		if r.PathValue("name") == "shop" {
 			writeJSON(w, 200, apiv1.DeploymentList{Deployments: []apiv1.Deployment{}})
+			return
+		}
+		switch b := r.URL.Query().Get("branch"); b {
+		case "", "main":
+		case "dev":
+			writeJSON(w, 200, apiv1.DeploymentList{Deployments: []apiv1.Deployment{fixtureInstanceDeployment("dep_3", b, apiv1.DeploymentStatusHealthy)}})
+			return
+		default:
+			writeError(w, 400, "invalid_request", "app moimroom does not deploy branch "+b)
 			return
 		}
 		later := fixtureDeployment("dep_2", apiv1.DeploymentStatusBuilding)
@@ -130,7 +204,7 @@ func newDeployFake(t *testing.T) *deployFake {
 		n, script := f.conns, f.events
 		f.conns++
 		f.mu.Unlock()
-		if id := r.PathValue("id"); script == nil || (id != "dep_1" && id != "dep_2") {
+		if id := r.PathValue("id"); script == nil || (id != "dep_1" && id != "dep_2" && id != "dep_4") {
 			writeError(w, 404, "deployment_not_found", "deployment not found")
 			return
 		}
@@ -258,19 +332,31 @@ func fixtureFileApp() apiv1.App {
 
 func fixtureRegisteredApp() apiv1.App {
 	last := fixtureDeployment("dep_1", apiv1.DeploymentStatusHealthy)
+	url := ptr("https://moimroom.hopcharlie.dev")
+	status := []apiv1.AppEnvironmentStatus{
+		{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusHealthy, Commit: ptr(testSHA), SyncStatus: ptr("Synced"), HealthStatus: ptr("Healthy")},
+		{Env: "eks", Status: apiv1.DeploymentEnvironmentStatusDegraded, Commit: ptr(testSHA), SyncStatus: ptr("Synced"), HealthStatus: ptr("Degraded")},
+	}
+	devLast := fixtureInstanceDeployment("dep_3", "dev", apiv1.DeploymentStatusHealthy)
 	return apiv1.App{Name: "moimroom", Namespace: "moimroom", Database: apiv1.AppDatabase{Name: "app", User: "app", Schemas: []string{}},
 		Environments: []apiv1.AppEnvironment{},
 		Deploy: &apiv1.AppDeploy{Repo: "org/moimroom", Branch: "main", AutoDeploy: true, Environments: []string{"gke", "eks"},
-			CreatedAt: t0, CreatedBy: "alice", Spec: fixtureSpec(), SpecCommit: testSHA, Url: ptr("https://moimroom.hopcharlie.dev"),
-			LastDeployment: &last,
-			Status: []apiv1.AppEnvironmentStatus{
-				{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusHealthy, Commit: ptr(testSHA), SyncStatus: ptr("Synced"), HealthStatus: ptr("Healthy")},
-				{Env: "eks", Status: apiv1.DeploymentEnvironmentStatusDegraded, Commit: ptr(testSHA), SyncStatus: ptr("Synced"), HealthStatus: ptr("Degraded")},
+			CreatedAt: t0, CreatedBy: "alice", Spec: fixtureSpec(), SpecCommit: testSHA, Url: url,
+			LastDeployment: &last, Status: status,
+			Instances: []apiv1.AppInstance{
+				{Name: "moimroom", Branch: "main", Default: true, AutoDeploy: true, Spec: fixtureSpec(), SpecCommit: testSHA, Url: url,
+					CreatedAt: t0, CreatedBy: "alice", LastDeployment: &last, Status: status},
+				{Name: "moimroom--dev", Branch: "dev", AutoDeploy: false, Spec: fixtureSpec(), SpecCommit: devSHA, Url: ptr("https://moimroom--dev.hopcharlie.dev"),
+					CreatedAt: t0.Add(time.Hour), CreatedBy: "bob", LastDeployment: &devLast,
+					Status: []apiv1.AppEnvironmentStatus{
+						{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusHealthy, Commit: ptr(devSHA)},
+						{Env: "eks", Status: apiv1.DeploymentEnvironmentStatusPending},
+					}},
 			}}}
 }
 
 func fixtureDeployment(id string, status apiv1.DeploymentStatus) apiv1.Deployment {
-	d := apiv1.Deployment{Id: id, App: "moimroom", Ref: "main", Commit: testSHA, Trigger: apiv1.DeploymentTriggerRegister,
+	d := apiv1.Deployment{Id: id, App: "moimroom", Branch: "main", Instance: "moimroom", Ref: "main", Commit: testSHA, Trigger: apiv1.DeploymentTriggerRegister,
 		TriggeredBy: "alice", Status: status, CreatedAt: t0, Images: []apiv1.DeploymentImage{},
 		Environments: []apiv1.DeploymentEnvironment{
 			{Env: "gke", Status: apiv1.DeploymentEnvironmentStatusPending},
@@ -292,6 +378,19 @@ func fixtureDeployment(id string, status apiv1.DeploymentStatus) apiv1.Deploymen
 		d.Error = ptr("build web: exit status 1")
 	case apiv1.DeploymentStatusSuperseded:
 		d.FinishedAt = ptr(t0.Add(30 * time.Second))
+	}
+	return d
+}
+
+// fixtureInstanceDeployment deploys the head of branch into the instance
+// added for it.
+func fixtureInstanceDeployment(id, branch string, status apiv1.DeploymentStatus) apiv1.Deployment {
+	d := fixtureDeployment(id, status)
+	d.Branch, d.Instance, d.Ref, d.Commit = branch, "moimroom--"+strings.ReplaceAll(branch, "/", "-"), branch, devSHA
+	for i, e := range d.Environments {
+		if e.Url != nil {
+			d.Environments[i].Url = ptr("https://" + d.Instance + "-" + e.Env + ".hopcharlie.dev")
+		}
 	}
 	return d
 }
@@ -339,6 +438,8 @@ func TestAppSpecInvalidIsShownWithPaths(t *testing.T) {
 	for _, args := range [][]string{
 		{"app", "add", "--repo", "org/broken", "--env", "eks"},
 		{"app", "add", "--repo", "org/broken", "--env", "eks", "--watch"},
+		{"app", "branch", "add", "moimroom", "broken"},
+		{"app", "branch", "add", "moimroom", "broken", "--watch"},
 		{"deploy", "moimroom", "--ref", "broken"},
 		{"--json", "deploy", "moimroom", "--ref", "broken"},
 	} {
@@ -526,6 +627,7 @@ func TestDeployCommands(t *testing.T) {
 		t.Errorf("query %q", q)
 	}
 	aligned(t, out, "STATUS", "dep_1", "[ok] healthy")
+	aligned(t, out, "BRANCH", "dep_1", "main")
 	aligned(t, out, "ENVS", "dep_1", "[ok] gke, [ok] eks")
 	aligned(t, out, "DURATION", "dep_1", "1m35s")
 	aligned(t, out, "ENVS", "dep_2", "[ ] gke, [ ] eks")
@@ -537,7 +639,7 @@ func TestDeployCommands(t *testing.T) {
 	}
 
 	out = h.run("", "deploy", "show", "dep_1").ok(t).stdout
-	for _, want := range []string{"Deployment:  dep_1", "Status:      [x] failed", "Commit:      " + testSHA, "Trigger:     register by alice",
+	for _, want := range []string{"Deployment:  dep_1", "Branch:      main", "Instance:    moimroom", "Status:      [x] failed", "Commit:      " + testSHA, "Trigger:     register by alice",
 		"Duration:    40.0s", "Error:       build web: exit status 1", "ENV  STATUS"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("deploy show lacks %q:\n%s", want, out)
@@ -652,7 +754,8 @@ func TestAppRm(t *testing.T) {
 	h := f.harness(t)
 
 	r := h.run("moimroom\n", "app", "rm", "moimroom").ok(t)
-	if !strings.Contains(r.stderr, "deletes app moimroom from gke, eks with its databases and buckets") || !strings.HasSuffix(r.stderr, "Type the app name to confirm: \n") {
+	if !strings.Contains(r.stderr, "deletes app moimroom from gke, eks with its databases and buckets, together with its added instance moimroom--dev. The data cannot be recovered.") ||
+		!strings.HasSuffix(r.stderr, "Type the app name to confirm: \n") {
 		t.Errorf("prompt %q", r.stderr)
 	}
 	if r.stdout != "Deleted app moimroom. Argo CD is removing its workloads and data.\n" || f.sent("DELETE", "/v1/apps/moimroom") != 1 {
@@ -733,7 +836,7 @@ services:
     public: true
 `)
 	want := bad + ` is invalid (4 errors):
-  name: must be 1 to 32 lowercase letters, digits and hyphens, starting and ending with a letter or digit
+  name: must be 3 to 32 lowercase letters, digits and hyphens, starting and ending with a letter or digit
   services[0].port: is required
   services[0].env.PORT: is set by the platform (PORT, DATABASE_URL and S3_* are reserved)
   services[1].public: only one service may be public; services[0] is
@@ -808,6 +911,7 @@ func TestAppListShowAndRepos(t *testing.T) {
 	if !ok || !strings.HasPrefix(reg, "Registered from GitHub\n") {
 		t.Fatalf("app list sections:\n%s", out)
 	}
+	aligned(t, reg, "INSTANCES", "gke", "2")
 	aligned(t, reg, "REPO", "gke", "org/moimroom")
 	aligned(t, reg, "BRANCH", "gke", "main")
 	aligned(t, reg, "STATUS", "gke", "[ok] healthy")
@@ -841,8 +945,15 @@ func TestAppListShowAndRepos(t *testing.T) {
 	}
 	aligned(t, out, "PORT", "web", "8080")
 	aligned(t, out, "SYNC", "eks  [x] degraded", "Synced")
-	_, latest, _ := strings.Cut(out, "Latest deployments\n")
+	_, rest, _ := strings.Cut(out, "\nInstances\n")
+	instances, latest, _ := strings.Cut(rest, "Latest deployments\n")
+	aligned(t, instances, "BRANCH", "moimroom--dev", "dev")
+	aligned(t, instances, "DEFAULT", "moimroom--dev", "no")
+	aligned(t, instances, "STATUS", "moimroom--dev", "[ok] gke, [ ] eks")
+	aligned(t, instances, "URL", "moimroom--dev", "https://moimroom--dev.hopcharlie.dev")
+	aligned(t, instances, "DEFAULT", "moimroom ", "yes")
 	aligned(t, latest, "STATUS", "dep_2", "[..] building")
+	aligned(t, latest, "BRANCH", "dep_2", "main")
 
 	out = h.run("", "app", "show", "shop").ok(t).stdout
 	for _, want := range []string{"In the apps file, for migrations (database shop@shop)", "shop-db-eks-rw.shop.eks.ts.net:5432",
@@ -887,6 +998,13 @@ func TestDeployUsageErrors(t *testing.T) {
 		{"app", "validate", "--branch", "dev"},
 		{"app", "validate", "--remote"},
 		{"app", "validate", "--remote", "--repo", "org/moimroom", "-f", "x.yaml"},
+		{"app", "branch"},
+		{"app", "branch", "bogus"},
+		{"app", "branch", "add", "moimroom"},
+		{"app", "branch", "add", "moimroom", "dev", "extra"},
+		{"app", "branch", "list"},
+		{"app", "branch", "rm", "moimroom"},
+		{"deploy", "list", "moimroom", "--branch"},
 		{"deploy"},
 		{"deploy", "a", "b"},
 		{"deploy", "list"},
@@ -898,7 +1016,7 @@ func TestDeployUsageErrors(t *testing.T) {
 		{"deploy", "moimroom", "--nope"},
 	} {
 		r := h.run("", args...)
-		if args[len(args)-1] == "app" { // a bare group prints help
+		if last := args[len(args)-1]; last == "app" || last == "branch" { // a bare group prints help
 			if r.code != ExitOK || !strings.Contains(r.stdout, "Available Commands") {
 				t.Errorf("%v: exit %d, %q", args, r.code, r.stdout)
 			}
