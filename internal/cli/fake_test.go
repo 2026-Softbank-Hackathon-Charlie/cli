@@ -30,6 +30,30 @@ type fakeServer struct {
 	reqs   []fakeReq
 	events func(w http.ResponseWriter, r *http.Request, conn int)
 	conns  int
+
+	// Device login. Each POST /v1/auth/device starts a new one with the
+	// device code fakeDeviceCode(n) and the user code fakeUserCodes[n];
+	// devicePoll answers the n-th poll for a device code with "pending"
+	// (also when nil), "approved", "denied", "expired", "500" or "drop" (a
+	// broken connection).
+	starts     int
+	polls      map[string]int
+	devicePoll func(deviceCode string, n int) string
+}
+
+var fakeUserCodes = []string{"BCDF-GHJK", "LMNP-QRST", "VWXZ-BCDF"}
+
+func fakeDeviceCode(n int) string { return fmt.Sprintf("dev-secret-%d", n) }
+
+// fakeCLIToken is the token an approved poll for deviceCode hands out.
+func fakeCLIToken(deviceCode string) string { return "cli-token-for-" + deviceCode }
+
+// fakeTokenExpiry is when every fake CLI token expires.
+var fakeTokenExpiry = t0.Add(30 * 24 * time.Hour)
+
+// pollScript answers the polls in order and repeats the last answer.
+func pollScript(answers ...string) func(string, int) string {
+	return func(_ string, n int) string { return answers[min(n, len(answers)-1)] }
 }
 
 type fakeReq struct {
@@ -40,10 +64,48 @@ type fakeReq struct {
 
 func newFake(t *testing.T, token string) *fakeServer {
 	t.Helper()
-	f := &fakeServer{token: token}
+	f := &fakeServer{token: token, polls: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, apiv1.Principal{Name: "alice", Role: apiv1.RoleOperator})
+	})
+	mux.HandleFunc("POST /v1/auth/device", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		n := f.starts
+		f.starts++
+		f.mu.Unlock()
+		writeJSON(w, 200, apiv1.DeviceLoginStart{DeviceCode: fakeDeviceCode(n), UserCode: fakeUserCodes[n%len(fakeUserCodes)],
+			VerificationUri: "https://console.hopcharlie.dev/#device", ExpiresIn: 600, Interval: 5})
+	})
+	mux.HandleFunc("POST /v1/auth/device/token", func(w http.ResponseWriter, r *http.Request) {
+		var req apiv1.DeviceTokenRequest
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		f.mu.Lock()
+		n, script := f.polls[req.DeviceCode], f.devicePoll
+		f.polls[req.DeviceCode]++
+		f.mu.Unlock()
+		answer := "pending"
+		if script != nil {
+			answer = script(req.DeviceCode, n)
+		}
+		switch answer {
+		case "pending":
+			writeError(w, 400, "authorization_pending", "not approved yet; ask again in 5 seconds")
+		case "approved":
+			writeJSON(w, 200, apiv1.Session{Token: fakeCLIToken(req.DeviceCode), ExpiresAt: fakeTokenExpiry,
+				Principal: apiv1.Principal{Name: "alice", Role: apiv1.RoleAgent}})
+		case "denied":
+			writeError(w, 400, "access_denied", "an administrator denied this device login")
+		case "expired":
+			writeError(w, 400, "expired_token", "the device login is unknown, expired or already used; start a new one")
+		case "500":
+			writeError(w, 500, "internal", "internal error")
+		case "drop":
+			panic(http.ErrAbortHandler)
+		}
+	})
+	mux.HandleFunc("POST /v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /v1/envs", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, fixtureEnvs())
@@ -137,7 +199,8 @@ func newFake(t *testing.T, token string) *fakeServer {
 		f.mu.Lock()
 		f.reqs = append(f.reqs, fakeReq{r.Method, r.URL.EscapedPath(), r.URL.RawQuery, r.Header.Clone(), body})
 		f.mu.Unlock()
-		if f.token != "" && r.Header.Get("Authorization") != "Bearer "+f.token {
+		public := r.URL.Path == "/v1/auth/device" || r.URL.Path == "/v1/auth/device/token"
+		if f.token != "" && !public && r.Header.Get("Authorization") != "Bearer "+f.token {
 			writeError(w, 401, "unauthorized", "missing or invalid bearer token")
 			return
 		}
@@ -272,11 +335,17 @@ func fixtureTraffic() apiv1.TrafficState {
 		Totals:   map[string]apiv1.BackendTotals{"gke": {Requests: 12000, Errors: 7}}}
 }
 
-// harness runs the CLI in-process with its own config dir and environment.
+// harness runs the CLI in-process with its own config dir, environment and
+// clock. Sleep returns at once and moves the clock on.
 type harness struct {
 	t   *testing.T
 	dir string
 	env map[string]string
+
+	now     time.Time
+	slept   []time.Duration
+	onSleep func(n int) // called after the n-th sleep (from 1), e.g. to cancel
+	http    *http.Client
 }
 
 type result struct {
@@ -288,7 +357,7 @@ func newHarness(t *testing.T, env map[string]string) *harness {
 	if env == nil {
 		env = map[string]string{}
 	}
-	return &harness{t: t, dir: t.TempDir(), env: env}
+	return &harness{t: t, dir: t.TempDir(), env: env, now: t0, http: http.DefaultClient}
 }
 
 func (h *harness) run(stdin string, args ...string) result {
@@ -305,7 +374,19 @@ func (h *harness) runCtx(ctx context.Context, stdin string, args ...string) resu
 		Stderr:     &errb,
 		Getenv:     func(k string) string { return h.env[k] },
 		ConfigDir:  func() (string, error) { return h.dir, nil },
-		HTTPClient: http.DefaultClient,
+		HTTPClient: h.http,
+		Now:        func() time.Time { return h.now },
+		Sleep: func(ctx context.Context, d time.Duration) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			h.slept = append(h.slept, d)
+			h.now = h.now.Add(d)
+			if h.onSleep != nil {
+				h.onSleep(len(h.slept))
+			}
+			return ctx.Err()
+		},
 	}
 	code := app.Run(ctx, args)
 	return result{code: code, stdout: out.String(), stderr: errb.String()}

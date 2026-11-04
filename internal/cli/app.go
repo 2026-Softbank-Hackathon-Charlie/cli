@@ -30,23 +30,28 @@ const (
 // requestTimeout bounds every call except event streams and polling loops.
 const requestTimeout = 30 * time.Second
 
-// App is one charlie process. Tests replace its I/O, environment and config
-// directory.
+// App is one charlie process. Tests replace its I/O, environment, config
+// directory and clock.
 type App struct {
 	Version    string
 	Stdin      io.Reader
 	Stdout     io.Writer
 	Stderr     io.Writer
 	Getenv     func(string) string
-	ConfigDir  func() (string, error) // charlie/config.json lives below it
+	ConfigDir  func() (string, error) // charlie/config.json lives below it unless CHARLIE_CONFIG_DIR is set
 	HTTPClient *http.Client
-	// Updater keeps an installed charlie current; nil turns updates off (tests).
+	// Now and Sleep pace the polling of a device login.
+	Now   func() time.Time
+	Sleep func(ctx context.Context, d time.Duration) error
+	// Updater keeps an installed charlie current; nil turns updates off
+	// (tests). Run sets an empty Dir to the charlie config directory.
 	Updater *update.Config
 }
 
 // New returns an App wired to the real process.
 func New(version string) *App {
-	a := &App{
+	u := update.Default("")
+	return &App{
 		Version:    version,
 		Stdin:      os.Stdin,
 		Stdout:     os.Stdout,
@@ -54,39 +59,74 @@ func New(version string) *App {
 		Getenv:     os.Getenv,
 		ConfigDir:  os.UserConfigDir,
 		HTTPClient: http.DefaultClient,
+		Now:        time.Now,
+		Sleep:      sleep,
+		Updater:    &u,
 	}
-	if dir, err := os.UserConfigDir(); err == nil {
-		u := update.Default(filepath.Join(dir, "charlie"))
-		a.Updater = &u
+}
+
+// sleep waits for d or until ctx ends.
+func sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return a
+}
+
+// updater returns the update configuration with its directory resolved, or
+// nil when updates are off or there is no config directory.
+func (a *App) updater() *update.Config {
+	if a.Updater == nil {
+		return nil
+	}
+	u := *a.Updater
+	if u.Dir == "" {
+		dir, err := a.configDir()
+		if err != nil {
+			return nil
+		}
+		u.Dir = dir
+	}
+	return &u
 }
 
 // Run executes args (without the program name) and returns the exit code.
 func (a *App) Run(ctx context.Context, args []string) int {
-	g := &globals{app: a}
+	g := &globals{app: a, updater: a.updater()}
 	root := g.rootCmd()
 	root.SetArgs(args)
 	root.SetIn(a.Stdin)
 	root.SetOut(a.Stdout)
 	root.SetErr(a.Stderr)
 
-	if a.Updater != nil {
-		if exe, err := a.Updater.Executable(); err == nil {
+	if g.updater != nil {
+		if exe, err := g.updater.Executable(); err == nil {
 			update.CleanOld(exe)
 		}
-		if msg := update.TakeNotice(*a.Updater); msg != "" {
+		if msg := update.TakeNotice(*g.updater); msg != "" {
 			fmt.Fprintln(a.Stderr, msg)
 		}
 	}
 	cmd, err := root.ExecuteContextC(ctx)
 	code := a.exit(err)
+	if code == ExitError && g.savedLogin && unauthorized(err) {
+		fmt.Fprintln(a.Stderr, `The saved login expired or was revoked; run "charlie login".`)
+	}
 	// After the command, so it never delays the output; the update itself
 	// runs in a separate process.
-	if a.Updater != nil && (cmd == nil || cmd.Name() != "update") {
-		update.MaybeStart(*a.Updater)
+	if g.updater != nil && (cmd == nil || cmd.Name() != "update") {
+		update.MaybeStart(*g.updater)
 	}
 	return code
+}
+
+func unauthorized(err error) bool {
+	var ae *client.APIError
+	return errors.As(err, &ae) && ae.Status == http.StatusUnauthorized
 }
 
 func (a *App) exit(err error) int {
@@ -138,12 +178,15 @@ type exitError struct {
 
 func (e *exitError) Error() string { return e.msg }
 
-// globals holds the persistent flags of one invocation.
+// globals holds the persistent flags and state of one invocation.
 type globals struct {
 	app     *App
+	updater *update.Config // nil: no automatic updates
 	json    bool
 	server  string
 	noColor bool
+	// savedLogin is set once a client uses the token from config.json.
+	savedLogin bool
 }
 
 func (g *globals) rootCmd() *cobra.Command {
@@ -154,10 +197,15 @@ func (g *globals) rootCmd() *cobra.Command {
 from GitHub and their deployments, plans, migrations, traffic, the result
 matrix and the audit log.
 
-Log in once with "charlie login --server URL"; CHARLIE_SERVER and CHARLIE_TOKEN
-override the saved login, and --server overrides both. The saved token is only
-sent to the server it was saved for; for another server set CHARLIE_TOKEN or
-log in to it.`,
+Log in once with "charlie login": it shows a code that an administrator enters
+in the web console, picking the role this CLI gets. Without --server or
+CHARLIE_SERVER it logs in to ` + defaultServer + `.
+
+CHARLIE_SERVER and CHARLIE_TOKEN override the saved login, and --server
+overrides both; programs with a static token set CHARLIE_TOKEN instead of
+logging in. The saved token is only sent to the server it was saved for; for
+another server set CHARLIE_TOKEN or log in to it. CHARLIE_CONFIG_DIR sets the
+directory of the saved login and the update files.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		Args:          noArgs,
@@ -220,18 +268,21 @@ func exactArgs(names ...string) cobra.PositionalArgs {
 // settings is the effective server and token.
 type settings struct {
 	server, token string
-	path          string // config file
-	savedServer   string // set when the saved token is for another server
+	path          string     // config file
+	savedServer   string     // set when the saved token is for another server
+	fromFile      bool       // token is the saved one
+	expiresAt     *time.Time // of the saved token, when fromFile and known
 }
 
 // settings applies the precedence: --server, then CHARLIE_SERVER and
 // CHARLIE_TOKEN, then the saved login. The saved token is used only for the
 // saved server.
 func (g *globals) settings(cmd *cobra.Command) (settings, error) {
-	path, err := configPath(g.app.ConfigDir)
+	dir, err := g.app.configDir()
 	if err != nil {
 		return settings{}, err
 	}
+	path := filepath.Join(dir, configFile)
 	file, err := loadConfig(path)
 	if err != nil {
 		return settings{}, err
@@ -259,13 +310,13 @@ func (g *globals) settings(cmd *cobra.Command) (settings, error) {
 			saved = file.Server
 		}
 		if saved == s.server {
-			s.token = file.Token
+			s.token, s.fromFile, s.expiresAt = file.Token, true, file.ExpiresAt
 		} else {
 			s.savedServer = saved
 		}
 	}
 	if v := g.app.Getenv("CHARLIE_TOKEN"); v != "" {
-		s.token = v
+		s.token, s.fromFile, s.expiresAt = v, false, nil
 	}
 	return s, nil
 }
@@ -285,7 +336,7 @@ func (g *globals) client(cmd *cobra.Command) (*client.Client, error) {
 		return nil, err
 	}
 	if s.server == "" {
-		return nil, errors.New(`no server configured; run "charlie login --server URL" or set CHARLIE_SERVER`)
+		return nil, errors.New(`no server configured; run "charlie login" or set CHARLIE_SERVER`)
 	}
 	if s.token == "" && s.savedServer != "" {
 		return nil, fmt.Errorf(`the saved login is for %s, not %s; run "charlie login --server %s" or set CHARLIE_TOKEN`,
@@ -294,6 +345,7 @@ func (g *globals) client(cmd *cobra.Command) (*client.Client, error) {
 	if s.token == "" {
 		return nil, fmt.Errorf(`not logged in to %s; run "charlie login" or set CHARLIE_TOKEN`, s.server)
 	}
+	g.savedLogin = s.fromFile
 	return g.newClient(s.server, s.token), nil
 }
 

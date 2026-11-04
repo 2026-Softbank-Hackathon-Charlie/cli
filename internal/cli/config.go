@@ -7,20 +7,48 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
+)
+
+// Files in the charlie config directory.
+const (
+	configFile  = "config.json"
+	pendingFile = "pending-login.json"
 )
 
 // config is the saved login.
 type config struct {
-	Server string `json:"server"`
-	Token  string `json:"token"`
+	Server    string     `json:"server"`
+	Token     string     `json:"token"`
+	ExpiresAt *time.Time `json:"expiresAt,omitempty"` // unknown for older files
 }
 
-func configPath(dir func() (string, error)) (string, error) {
-	d, err := dir()
-	if err != nil {
-		return "", fmt.Errorf("find the user config directory: %w", err)
+// pendingLogin is a device login waiting for an administrator's approval. It
+// is saved so that a later "charlie login", possibly another process, shows
+// the same code and finishes the login.
+type pendingLogin struct {
+	Server          string    `json:"server"`
+	DeviceCode      string    `json:"deviceCode"` // secret: never printed
+	UserCode        string    `json:"userCode"`
+	VerificationURI string    `json:"verificationUri"`
+	ExpiresAt       time.Time `json:"expiresAt"` // as the server said when it started
+	Interval        int       `json:"interval"`  // seconds between polls
+}
+
+// configDir is the directory holding config.json, pending-login.json and the
+// update files: CHARLIE_CONFIG_DIR, else charlie below the user config
+// directory.
+func (a *App) configDir() (string, error) {
+	if d := a.Getenv("CHARLIE_CONFIG_DIR"); d != "" {
+		// Absolute, so the background updater finds the same directory.
+		return filepath.Abs(d)
 	}
-	return filepath.Join(d, "charlie", "config.json"), nil
+	d, err := a.ConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("find the user config directory: %w (set CHARLIE_CONFIG_DIR)", err)
+	}
+	return filepath.Join(d, "charlie"), nil
 }
 
 // loadConfig returns an empty config when the file does not exist.
@@ -39,10 +67,32 @@ func loadConfig(path string) (config, error) {
 	return c, nil
 }
 
-// saveConfig writes the token file 0600 in a 0700 directory. It renames a
-// temporary file into place so a crash never leaves a half-written file, and
-// a pre-existing file never keeps wider permissions.
-func saveConfig(path string, c config) error {
+// loadPending returns nil when there is no pending login. A damaged file
+// counts as none: the next device login replaces it.
+func loadPending(path string) (*pendingLogin, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var p pendingLogin
+	if json.Unmarshal(b, &p) != nil || p.Server == "" || p.DeviceCode == "" || p.UserCode == "" {
+		return nil, nil
+	}
+	return &p, nil
+}
+
+func saveConfig(path string, c config) error { return writePrivate(path, c) }
+
+func savePending(path string, p *pendingLogin) error { return writePrivate(path, p) }
+
+// writePrivate writes v as JSON, 0600 in a 0700 directory, since both files
+// hold secrets. It renames a temporary file into place so a crash never
+// leaves a half-written file, and a pre-existing file never keeps wider
+// permissions.
+func writePrivate(path string, v any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -51,11 +101,12 @@ func saveConfig(path string, c config) error {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(c, "", "  ")
+	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(dir, "config-*.json") // created 0600
+	pattern := strings.TrimSuffix(filepath.Base(path), ".json") + "-*.json"
+	f, err := os.CreateTemp(dir, pattern) // created 0600
 	if err != nil {
 		return err
 	}
@@ -74,8 +125,8 @@ func saveConfig(path string, c config) error {
 	return os.Rename(tmp, path)
 }
 
-// removeConfig reports whether there was a file to remove.
-func removeConfig(path string) (bool, error) {
+// removeFile reports whether there was a file to remove.
+func removeFile(path string) (bool, error) {
 	err := os.Remove(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return false, nil

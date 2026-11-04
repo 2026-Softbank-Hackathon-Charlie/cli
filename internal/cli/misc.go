@@ -126,10 +126,10 @@ Updating needs the go command and access to the private repositories
 (GOPRIVATE=github.com/2026-Softbank-Hackathon-Charlie, git credentials for GitHub).`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if g.app.Updater == nil {
+			if g.updater == nil {
 				return errors.New("updates are not available in this build")
 			}
-			cfg := *g.app.Updater
+			cfg := *g.updater
 			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Minute)
 			defer cancel()
 			out := cmd.OutOrStdout()
