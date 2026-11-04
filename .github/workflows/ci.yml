@@ -48,7 +48,9 @@ jobs:
             exit 1
           fi
 
+      # A self-hosted runner keeps ~/go between jobs; restoring over it races with parallel jobs.
       - name: Restore Go cache from main
+        if: runner.environment == 'github-hosted'
         uses: actions/cache/restore@v4
         with:
           path: |
@@ -91,7 +93,7 @@ jobs:
 
       # Only main saves, so a PR spends no time uploading.
       - name: Save Go cache
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: |
