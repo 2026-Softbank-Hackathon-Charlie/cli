@@ -241,6 +241,51 @@ func TestFrame(t *testing.T) {
 	}
 }
 
+// A small canary step with too few requests is inconclusive, not a failure:
+// the platform moved on to the next step (platform ADR 0005).
+func TestFrameInconclusiveCanaryStep(t *testing.T) {
+	run := fixtureRun(apiv1.RunStatusRunning)
+	run.Canary = &apiv1.CanaryResult{Options: apiv1.CanaryOptions{Weights: []int{1, 10, 25, 50, 75, 90, 100}, StepDuration: ptr("10s")}}
+	v := newRunView()
+	v.apply(client.Message{Name: "snapshot", Snapshot: &run})
+	ev := func(seq int64, kind, msg string, data map[string]any) {
+		step := ""
+		e := apiv1.RunEvent{Seq: seq, Time: tsec(int(seq)), RunId: "run_1", Kind: kind, Step: &step, Message: &msg, Data: &data}
+		e = normalize(t, e)
+		v.apply(client.Message{Name: kind, Seq: seq, Event: &e})
+	}
+	ev(1, kindCanaryStep, "1% of reads to eks", map[string]any{"weight": 1})
+	ev(2, kindGateResult, "gate at 1% inconclusive", map[string]any{"weight": 1, "verdict": "inconclusive",
+		"gate": map[string]any{"passed": false, "reason": "only 2 requests reached the target (need 20); continuing to the next step", "requests": 2, "errorRate": 0, "p95Millis": 3}})
+	ev(3, kindCanaryStep, "10% of reads to eks", map[string]any{"weight": 10})
+	ev(4, kindGateResult, "gate at 10% passed", map[string]any{"weight": 10, "verdict": "ok",
+		"gate": map[string]any{"passed": true, "reason": "33 requests", "requests": 33, "errorRate": 0, "p95Millis": 3}})
+
+	out := v.frame(tsec(30), 0, 0)
+	for _, want := range []string{
+		"Canary 1%, 10%, 25%, 50%, 75%, 90%, 100% of reads, 10s per step",
+		"[..] inconclusive (only 2 requests reached the target (need 20); continuing to the next step), 2 requests",
+		"[ok] passed, 33 requests",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("frame lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "[x]") {
+		t.Errorf("an inconclusive step is shown as failed:\n%s", out)
+	}
+
+	// The same from a snapshot (e.g. after a reconnect), and a server without
+	// verdict still shows a failed gate as failed.
+	inc, failed := apiv1.CanaryStepVerdictInconclusive, apiv1.GateResult{Passed: false, Reason: "error rate 50.00% is above 1.00%", Requests: 40, ErrorRate: 0.5}
+	if got := gateText(apiv1.CanaryStep{Weight: 1, Verdict: &inc, Gate: &apiv1.GateResult{Reason: "only 0 requests"}}); !strings.HasPrefix(got, "[..] inconclusive") {
+		t.Errorf("snapshot inconclusive: %q", got)
+	}
+	if got := gateText(apiv1.CanaryStep{Weight: 10, Gate: &failed}); !strings.HasPrefix(got, "[x] error rate 50.00%") {
+		t.Errorf("no verdict, failed gate: %q", got)
+	}
+}
+
 func tsec(n int) time.Time { return t0.Add(time.Duration(n) * time.Second) }
 
 // feed applies one event at t0+sec seconds, with sec as its seq.

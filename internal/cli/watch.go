@@ -235,6 +235,10 @@ func (v *runView) liveEvent(e *apiv1.RunEvent, data map[string]any) {
 			i = len(v.canary) - 1
 		}
 		v.canary[i].Gate = &gate
+		if s, ok := data["verdict"].(string); ok && s != "" {
+			verdict := apiv1.CanaryStepVerdict(s)
+			v.canary[i].Verdict = &verdict
+		}
 		if v.canary[i].EndedAt == nil {
 			v.canary[i].EndedAt = &at
 		}
@@ -551,8 +555,19 @@ func gateText(s apiv1.CanaryStep) string {
 	}
 	nums := fmt.Sprintf("%d requests, %s errors, p95 %s", gt.Requests, percent(gt.ErrorRate),
 		human(time.Duration(float64(gt.P95Millis)*float64(time.Millisecond))))
-	if gt.Passed {
+	// verdict is newer than the gate; a server without it only sets gate.passed.
+	verdict := apiv1.CanaryStepVerdictFailed
+	switch {
+	case s.Verdict != nil:
+		verdict = *s.Verdict
+	case gt.Passed:
+		verdict = apiv1.CanaryStepVerdictOk
+	}
+	switch verdict {
+	case apiv1.CanaryStepVerdictOk:
 		return "[ok] passed, " + nums
+	case apiv1.CanaryStepVerdictInconclusive:
+		return "[..] inconclusive (" + gt.Reason + "), " + nums
 	}
 	return "[x] " + gt.Reason + ", " + nums
 }
