@@ -88,7 +88,7 @@ printed key again to retry without starting a second run.`,
 	}
 	f := cmd.Flags()
 	f.BoolVar(&autoSwitch, "auto-switch", false, "cut over as soon as data is in sync, without waiting for switch")
-	f.IntSliceVar(&weights, "canary", nil, "shares of read traffic to send to the target before cutover, e.g. 10,50")
+	f.IntSliceVar(&weights, "canary", nil, "shares of read traffic to send to the target before cutover, e.g. 1,10,25,50,75,90,100")
 	f.DurationVar(&step, "canary-step", 20*time.Second, "length of each canary step")
 	f.DurationVar(&observe, "observe", 0, "after cutover, check the target against the gate this long before the run ends, e.g. 2m")
 	f.DurationVar(&observeStep, "observe-step", 20*time.Second, "length of each observe step")
@@ -156,7 +156,7 @@ func runOptions(cmd *cobra.Command, fl runFlags) (*apiv1.CanaryOptions, *apiv1.O
 	var c *apiv1.CanaryOptions
 	if canaryOn {
 		if len(fl.weights) == 0 {
-			return nil, nil, usagef(cmd, "--canary needs at least one weight, e.g. --canary 10,50")
+			return nil, nil, usagef(cmd, "--canary needs at least one weight, e.g. --canary 1,10,25,50,75,90,100")
 		}
 		for _, w := range fl.weights {
 			if w < 1 || w > 100 {
