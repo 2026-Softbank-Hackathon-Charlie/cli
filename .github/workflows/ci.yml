@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   go:
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, hopcharlie]
     timeout-minutes: 15
     env:
       GOPRIVATE: github.com/2026-Softbank-Hackathon-Charlie
@@ -36,6 +36,9 @@ jobs:
             echo "::error::Repository secret MODULE_READ_TOKEN is not set (read access to platform and migration-engine)."
             exit 1
           fi
+          # Self-hosted runners keep ~/.gitconfig between jobs: keep the token in this job's temp dir.
+          export GIT_CONFIG_GLOBAL="$RUNNER_TEMP/gitconfig"
+          echo "GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL" >> "$GITHUB_ENV"
           git config --global url."https://x-access-token:${TOKEN}@github.com/2026-Softbank-Hackathon-Charlie/".insteadOf "https://github.com/2026-Softbank-Hackathon-Charlie/"
 
       - name: go.mod has no local replace
