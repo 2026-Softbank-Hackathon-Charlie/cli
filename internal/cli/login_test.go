@@ -157,7 +157,7 @@ func TestLoginNoWaitThenResume(t *testing.T) {
 	r := h.run("", "login", "--no-wait").ok(t)
 	noSecrets(t, r)
 	if want := instructions("BCDF-GHJK", t0.Add(10*time.Minute), "in 10 minutes") +
-		`After approving, run "charlie login --server ` + f.URL + `" to finish.` + "\n"; r.stdout != want {
+		`After approving, run "charlie login --server ` + f.URL + `" to finish (add --no-wait in scripts so it does not wait).` + "\n"; r.stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", r.stdout, want)
 	}
 	if n := len(f.pollsMade()); n != 0 || len(h.slept) != 0 {
@@ -230,6 +230,68 @@ func TestLoginHintsNameTheServer(t *testing.T) {
 	if r := h2.run("", "whoami"); r.code != ExitError ||
 		!strings.Contains(r.stderr, `not logged in to `+b.URL+`; run "charlie login --server `+b.URL+`" or set CHARLIE_TOKEN`) {
 		t.Errorf("whoami: exit %d, %q", r.code, r.stderr)
+	}
+}
+
+// Logging in again, e.g. for another role, ends the token it replaces on
+// that server, best effort.
+func TestLoginEndsReplacedToken(t *testing.T) {
+	f := newFake(t, "")
+	f.devicePoll = pollScript("approved")
+	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+	old := t0.Add(24 * time.Hour)
+	login := func(token string) {
+		t.Helper()
+		if err := saveConfig(h.configFile(), config{Server: f.URL, Token: token, ExpiresAt: &old}, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logouts := func() []string {
+		var tokens []string
+		for _, r := range f.requests() {
+			if r.method == "POST" && r.path == "/v1/auth/logout" {
+				tokens = append(tokens, r.header.Get("Authorization"))
+			}
+		}
+		return tokens
+	}
+
+	login("old-token")
+	r := h.run("", "login").ok(t)
+	if got := logouts(); !slices.Equal(got, []string{"Bearer old-token"}) {
+		t.Errorf("logouts %v", got)
+	}
+	if strings.Contains(r.stdout+r.stderr, "previous token") {
+		t.Errorf("note although the token was ended: %q %q", r.stdout, r.stderr)
+	}
+	if cfg := readFile[config](t, h.configFile()); cfg.Token != fakeCLIToken("dev-secret-0") {
+		t.Errorf("config = %+v", cfg)
+	}
+
+	// The server fails to end it: the login still succeeds and says so.
+	f.logoutCode = 500
+	login("old-token-2")
+	r = h.run("", "login").ok(t)
+	if want := "The previous token could not be ended (internal: internal error (HTTP 500)); it stays valid until " + stamp(old) + ".\n"; !strings.HasSuffix(r.stdout, want) {
+		t.Errorf("stdout %q, want suffix %q", r.stdout, want)
+	}
+	if cfg := readFile[config](t, h.configFile()); cfg.Token != fakeCLIToken("dev-secret-1") {
+		t.Errorf("config = %+v", cfg)
+	}
+	login("old-token-3")
+	r = h.run("", "--json", "login").ok(t)
+	if res := decodeOut[map[string]any](t, r.stdout); res["name"] != "alice" || !strings.Contains(r.stderr, "The previous token could not be ended") {
+		t.Errorf("--json: stdout %q, stderr %q", r.stdout, r.stderr)
+	}
+
+	// A saved login for another server is not touched.
+	n := len(logouts())
+	if err := saveConfig(h.configFile(), config{Server: "https://other.example", Token: "other", ExpiresAt: &old}, true); err != nil {
+		t.Fatal(err)
+	}
+	h.run("", "login").ok(t)
+	if len(logouts()) != n {
+		t.Errorf("logouts %v", logouts())
 	}
 }
 

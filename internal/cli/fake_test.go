@@ -41,6 +41,7 @@ type fakeServer struct {
 	// handed out its token answers expired_token from then on.
 	starts     int
 	interval   int
+	logoutCode int // POST /v1/auth/logout answers this (204 when 0)
 	polls      map[string]int
 	exchanged  map[string]bool
 	devicePoll func(deviceCode string, n int) string
@@ -124,6 +125,13 @@ func newFake(t *testing.T, token string) *fakeServer {
 		}
 	})
 	mux.HandleFunc("POST /v1/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		code := f.logoutCode
+		f.mu.Unlock()
+		if code != 0 {
+			writeError(w, code, "internal", "internal error")
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /v1/envs", func(w http.ResponseWriter, r *http.Request) {
