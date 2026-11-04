@@ -25,6 +25,8 @@ const (
 	// approvalGrace is how long after the code's expiry an approved device
 	// login can still be exchanged: approving extends the window by this.
 	approvalGrace = 10 * time.Minute
+	// maxPollInterval caps the interval the server asks for.
+	maxPollInterval = 60
 	// maxClientChars is the server's limit for the client description.
 	maxClientChars = 200
 	// logoutTimeout bounds the best-effort logout call.
@@ -56,10 +58,26 @@ steps:
   charlie login --no-wait    # prints the code and exits
   charlie login              # after the approval, saves the token
 
-Programs with a static token set CHARLIE_TOKEN instead of logging in.`,
+When the code was already approved, "charlie login --no-wait" saves the token
+too. Programs with a static token set CHARLIE_TOKEN instead of logging in.`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			s, err := g.settings(cmd)
+			path, err := g.configPath()
+			if err != nil {
+				return err
+			}
+			file, err := loadConfig(path)
+			if err == nil && file.Server != "" {
+				if _, nerr := normalizeServer(file.Server); nerr != nil {
+					err = fmt.Errorf("read %s: %w", path, nerr)
+				}
+			}
+			if err != nil {
+				// Logging in is the way out, so a damaged file must not stop it.
+				fmt.Fprintf(g.app.Stderr, "warning: ignoring the saved login (%v); logging in replaces it\n", err)
+				file = config{}
+			}
+			s, err := g.resolve(cmd, path, file)
 			if err != nil {
 				return err
 			}
@@ -68,14 +86,28 @@ Programs with a static token set CHARLIE_TOKEN instead of logging in.`,
 				g:           g,
 				server:      server,
 				c:           g.newClient(server, ""),
-				configPath:  s.path,
-				pendingPath: filepath.Join(filepath.Dir(s.path), pendingFile),
+				configPath:  path,
+				pendingPath: filepath.Join(filepath.Dir(path), pendingFile),
+				ownDir:      g.app.ownConfigDir(),
+				startToken:  file.Token,
+				again:       loginCommand(server, s.fileServer),
 			}
 			return l.run(cmd.Context(), noWait)
 		},
 	}
 	cmd.Flags().BoolVar(&noWait, "no-wait", false, `print the code and exit; after the approval, "charlie login" finishes`)
 	return cmd
+}
+
+// loginCommand is the command that logs in to server: plain "charlie login"
+// when that goes there anyway (the saved login's server, else the default),
+// otherwise with --server. CHARLIE_SERVER is left out on purpose: the next
+// run may not have it.
+func loginCommand(server, fileServer string) string {
+	if server == cmp.Or(fileServer, defaultServer) {
+		return "charlie login"
+	}
+	return "charlie login --server " + server
 }
 
 // deviceLogin is one "charlie login".
@@ -85,7 +117,10 @@ type deviceLogin struct {
 	c           *client.Client
 	configPath  string
 	pendingPath string
-	noted       bool // a retry note was printed
+	ownDir      bool   // the config directory may be tightened to 0700
+	startToken  string // in config.json when this login started
+	again       string // the command that resumes this login
+	noted       bool   // a retry note was printed
 }
 
 // loginResult is what login prints with --json, and whoami.
@@ -115,17 +150,26 @@ func (l *deviceLogin) run(ctx context.Context, noWait bool) error {
 		s, err := l.poll(ctx, p)
 		switch code := client.ErrorCode(err); {
 		case err == nil:
-			return l.finish(s)
+			return l.finish(p, s)
 		case code == "authorization_pending":
 		case code == "expired_token":
-			l.forget()
+			if done, err := l.finishedElsewhere(ctx); done {
+				return err
+			}
+			l.forget(p)
 			p = nil // start a new one below
 		case code == "access_denied":
-			l.forget()
+			l.forget(p)
 			return errDenied
 		case ctx.Err() != nil:
 			return l.interrupted()
-		case noWait || !transient(err):
+		case !transient(err):
+			// Not an answer about the device login (e.g. a proxy's error
+			// page): drop it rather than fail the same way every time.
+			fmt.Fprintf(l.g.app.Stderr, "could not check the pending login (%v); starting a new one\n", err)
+			l.forget(p)
+			p = nil
+		case noWait:
 			return fmt.Errorf("check the pending login with %s: %w", l.server, err)
 		default:
 			retry = err
@@ -143,9 +187,9 @@ func (l *deviceLogin) run(ctx context.Context, noWait bool) error {
 		if l.g.json {
 			return l.g.out().json(pendingCode{UserCode: p.UserCode, VerificationURI: p.VerificationURI, ExpiresAt: p.ExpiresAt, Server: p.Server})
 		}
-		return l.say(l.instructions(p) + fmt.Sprintf("After approving, run %q to finish.\n", l.again()))
+		return l.say(l.instructions(p) + fmt.Sprintf("After approving, run %q to finish.\n", l.again))
 	}
-	if err := l.say(l.instructions(p) + fmt.Sprintf("Waiting for approval... (Ctrl-C stops waiting; %q resumes)\n", l.again())); err != nil {
+	if err := l.say(l.instructions(p) + fmt.Sprintf("Waiting for approval... (Ctrl-C stops waiting; %q resumes)\n", l.again)); err != nil {
 		return err
 	}
 	if retry != nil {
@@ -171,7 +215,7 @@ func (l *deviceLogin) start(ctx context.Context) (*pendingLogin, error) {
 		ExpiresAt:       l.g.app.Now().Add(time.Duration(d.ExpiresIn) * time.Second).Truncate(time.Second),
 		Interval:        d.Interval,
 	}
-	if err := savePending(l.pendingPath, p); err != nil {
+	if err := savePending(l.pendingPath, p, l.ownDir); err != nil {
 		return nil, fmt.Errorf("save the pending login: %w", err)
 	}
 	return p, nil
@@ -181,29 +225,26 @@ func (l *deviceLogin) start(ctx context.Context) (*pendingLogin, error) {
 // Network errors, timeouts and 5xx are retried. A cancelled ctx keeps the
 // pending login for the next "charlie login".
 func (l *deviceLogin) wait(ctx context.Context, p *pendingLogin) error {
-	interval := time.Duration(max(p.Interval, 1)) * time.Second
 	// By then the server has ended the device login even if it was approved
 	// at the last moment; this only guards against waiting forever.
 	giveUp := p.ExpiresAt.Add(approvalGrace)
 	for {
-		if l.g.app.Sleep(ctx, interval) != nil {
-			return l.interrupted()
-		}
 		if l.g.app.Now().After(giveUp) {
-			l.forget()
-			return l.expired(p)
+			return l.expired(ctx, p)
+		}
+		if l.g.app.Sleep(ctx, pollInterval(p)) != nil {
+			return l.interrupted()
 		}
 		s, err := l.poll(ctx, p)
 		switch code := client.ErrorCode(err); {
 		case err == nil:
-			return l.finish(s)
+			return l.finish(p, s)
 		case code == "authorization_pending":
 		case code == "access_denied":
-			l.forget()
+			l.forget(p)
 			return errDenied
 		case code == "expired_token":
-			l.forget()
-			return l.expired(p)
+			return l.expired(ctx, p)
 		case ctx.Err() != nil:
 			return l.interrupted()
 		case transient(err):
@@ -214,6 +255,11 @@ func (l *deviceLogin) wait(ctx context.Context, p *pendingLogin) error {
 	}
 }
 
+// pollInterval is the server's interval, from 1 to maxPollInterval seconds.
+func pollInterval(p *pendingLogin) time.Duration {
+	return time.Duration(min(max(p.Interval, 1), maxPollInterval)) * time.Second
+}
+
 func (l *deviceLogin) poll(ctx context.Context, p *pendingLogin) (*apiv1.Session, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
@@ -221,15 +267,57 @@ func (l *deviceLogin) poll(ctx context.Context, p *pendingLogin) (*apiv1.Session
 }
 
 // finish saves the token and forgets the pending login.
-func (l *deviceLogin) finish(s *apiv1.Session) error {
-	if err := saveConfig(l.configPath, config{Server: l.server, Token: s.Token, ExpiresAt: &s.ExpiresAt}); err != nil {
+func (l *deviceLogin) finish(p *pendingLogin, s *apiv1.Session) error {
+	if s.Token == "" {
+		l.forget(p) // the server handed out its one answer
+		return fmt.Errorf("%s approved the login but sent no token", l.server)
+	}
+	if err := saveConfig(l.configPath, config{Server: l.server, Token: s.Token, ExpiresAt: &s.ExpiresAt}, l.ownDir); err != nil {
 		return fmt.Errorf("save the login: %w", err)
 	}
-	l.forget()
-	return show(l.g, &loginResult{Principal: s.Principal, ExpiresAt: &s.ExpiresAt}, func(r *loginResult) string {
-		return fmt.Sprintf("Logged in to %s as %s (%s) until %s.\nSaved to %s\n",
-			l.server, r.Name, r.Role, stamp(*r.ExpiresAt), l.configPath)
+	l.forget(p)
+	return l.loggedIn(&loginResult{Principal: s.Principal, ExpiresAt: &s.ExpiresAt})
+}
+
+func (l *deviceLogin) loggedIn(r *loginResult) error {
+	return show(l.g, r, func(r *loginResult) string {
+		until := ""
+		if r.ExpiresAt != nil {
+			until = " until " + stamp(*r.ExpiresAt)
+		}
+		return fmt.Sprintf("Logged in to %s as %s (%s)%s.\nSaved to %s\n", l.server, r.Name, r.Role, until, l.configPath)
 	})
+}
+
+// expired ends a device login the server no longer has.
+func (l *deviceLogin) expired(ctx context.Context, p *pendingLogin) error {
+	if done, err := l.finishedElsewhere(ctx); done {
+		return err
+	}
+	l.forget(p)
+	return fmt.Errorf("the code %s expired; %q gets a new one", p.UserCode, l.again)
+}
+
+// finishedElsewhere reports whether another "charlie login" got the token
+// for this device login: the server hands it out once and answers
+// expired_token afterwards, and the other process saved it to config.json.
+// It then prints that login like finish does.
+func (l *deviceLogin) finishedElsewhere(ctx context.Context) (bool, error) {
+	cfg, err := loadConfig(l.configPath)
+	if err != nil || cfg.Token == "" || cfg.Token == l.startToken {
+		return false, nil
+	}
+	if u, err := normalizeServer(cfg.Server); err != nil || u != l.server {
+		return false, nil
+	}
+	fmt.Fprintln(l.g.app.Stderr, `Another "charlie login" finished this login.`)
+	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	me, err := l.g.newClient(l.server, cfg.Token).Me(ctx)
+	if err != nil {
+		return true, fmt.Errorf("check the token it saved: %w", err)
+	}
+	return true, l.loggedIn(&loginResult{Principal: *me, ExpiresAt: cfg.ExpiresAt})
 }
 
 // instructions tell the person what to do with the code.
@@ -254,26 +342,20 @@ func (l *deviceLogin) note(p *pendingLogin, err error) {
 		return
 	}
 	l.noted = true
-	fmt.Fprintf(l.g.app.Stderr, "cannot reach %s (%v); retrying every %ds\n", l.server, err, max(p.Interval, 1))
+	fmt.Fprintf(l.g.app.Stderr, "cannot reach %s (%v); retrying every %v\n", l.server, err, pollInterval(p))
 }
 
-// again is the command that resumes this login.
-func (l *deviceLogin) again() string {
-	if l.g.server != "" {
-		return "charlie login --server " + l.server
+// forget removes the pending login p, unless another "charlie login" has
+// replaced it with its own since.
+func (l *deviceLogin) forget(p *pendingLogin) {
+	if cur, _ := loadPending(l.pendingPath); cur != nil && cur.DeviceCode == p.DeviceCode {
+		_, _ = removeFile(l.pendingPath)
 	}
-	return "charlie login"
-}
-
-func (l *deviceLogin) forget() { _, _ = removeFile(l.pendingPath) }
-
-func (l *deviceLogin) expired(p *pendingLogin) error {
-	return fmt.Errorf("the code %s expired; %q gets a new one", p.UserCode, l.again())
 }
 
 func (l *deviceLogin) interrupted() error {
 	return &exitError{code: ExitInterrupted, msg: fmt.Sprintf(
-		"interrupted; the login is still pending and %q resumes it with the same code", l.again())}
+		"interrupted; the login is still pending and %q resumes it with the same code", l.again)}
 }
 
 // transient reports whether asking again may work: network errors and
@@ -324,21 +406,28 @@ func (g *globals) logoutCmd() *cobra.Command {
 		Short: "End the saved login on the server and remove it",
 		Long: `Asks the server to end the saved token, then removes config.json and any
 pending login. When the server cannot be reached, the token stays valid on
-the server until it expires.`,
+the server until it expires. A static token saved by an older charlie (one
+without an expiry) cannot be ended this way and stays valid.`,
 		Args: noArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			dir, err := g.app.configDir()
+			path, err := g.configPath()
 			if err != nil {
 				return err
 			}
-			path, pending := filepath.Join(dir, configFile), filepath.Join(dir, pendingFile)
+			pending := filepath.Join(filepath.Dir(path), pendingFile)
 			file, _ := loadConfig(path) // a damaged file is removed all the same
 
 			var out string
-			if file.Token != "" {
-				out = fmt.Sprintf("Logged out of %s. %s\n", file.Server, g.endToken(cmd.Context(), file))
-			} else {
+			switch {
+			case file.Token == "":
 				out = "Not logged in.\n"
+			case file.ExpiresAt == nil:
+				// Only the stdin login of older versions saved tokens without
+				// an expiry: static tokens, which the server cannot end.
+				out = fmt.Sprintf("Logged out of %s on this machine only. The saved token has no expiry, so it is a static token\n"+
+					"from an older charlie; logout cannot end it and it stays valid on the server.\n", file.Server)
+			default:
+				out = fmt.Sprintf("Logged out of %s. %s\n", file.Server, g.endToken(cmd.Context(), file))
 			}
 			for _, f := range []string{path, pending} {
 				removed, err := removeFile(f)
@@ -360,10 +449,7 @@ func (g *globals) endToken(ctx context.Context, file config) string {
 	defer cancel()
 	err := g.newClient(file.Server, file.Token).Logout(ctx)
 	var ae *client.APIError
-	until := "it expires"
-	if file.ExpiresAt != nil {
-		until = stamp(*file.ExpiresAt)
-	}
+	until := stamp(*file.ExpiresAt)
 	switch {
 	case err == nil:
 		return "The server ended the token."

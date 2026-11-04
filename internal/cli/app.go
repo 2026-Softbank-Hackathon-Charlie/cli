@@ -198,8 +198,8 @@ from GitHub and their deployments, plans, migrations, traffic, the result
 matrix and the audit log.
 
 Log in once with "charlie login": it shows a code that an administrator enters
-in the web console, picking the role this CLI gets. Without --server or
-CHARLIE_SERVER it logs in to ` + defaultServer + `.
+in the web console, picking the role this CLI gets. Without --server,
+CHARLIE_SERVER or a saved login it logs in to ` + defaultServer + `.
 
 CHARLIE_SERVER and CHARLIE_TOKEN override the saved login, and --server
 overrides both; programs with a static token set CHARLIE_TOKEN instead of
@@ -269,25 +269,41 @@ func exactArgs(names ...string) cobra.PositionalArgs {
 type settings struct {
 	server, token string
 	path          string     // config file
+	fileServer    string     // of the saved login, normalized when valid
 	savedServer   string     // set when the saved token is for another server
 	fromFile      bool       // token is the saved one
 	expiresAt     *time.Time // of the saved token, when fromFile and known
+}
+
+func (g *globals) configPath() (string, error) {
+	dir, err := g.app.configDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, configFile), nil
 }
 
 // settings applies the precedence: --server, then CHARLIE_SERVER and
 // CHARLIE_TOKEN, then the saved login. The saved token is used only for the
 // saved server.
 func (g *globals) settings(cmd *cobra.Command) (settings, error) {
-	dir, err := g.app.configDir()
+	path, err := g.configPath()
 	if err != nil {
 		return settings{}, err
 	}
-	path := filepath.Join(dir, configFile)
 	file, err := loadConfig(path)
 	if err != nil {
 		return settings{}, err
 	}
-	s := settings{server: file.Server, path: path}
+	return g.resolve(cmd, path, file)
+}
+
+// resolve is settings for the saved login file read from path.
+func (g *globals) resolve(cmd *cobra.Command, path string, file config) (settings, error) {
+	s := settings{server: file.Server, path: path, fileServer: file.Server}
+	if u, err := normalizeServer(file.Server); err == nil {
+		s.fileServer = u
+	}
 	if v := g.app.Getenv("CHARLIE_SERVER"); v != "" {
 		s.server = v
 	}
@@ -305,14 +321,10 @@ func (g *globals) settings(cmd *cobra.Command) (settings, error) {
 		s.server = u
 	}
 	if file.Token != "" {
-		saved, err := normalizeServer(file.Server)
-		if err != nil {
-			saved = file.Server
-		}
-		if saved == s.server {
+		if s.fileServer == s.server {
 			s.token, s.fromFile, s.expiresAt = file.Token, true, file.ExpiresAt
 		} else {
-			s.savedServer = saved
+			s.savedServer = s.fileServer
 		}
 	}
 	if v := g.app.Getenv("CHARLIE_TOKEN"); v != "" {
@@ -343,7 +355,7 @@ func (g *globals) client(cmd *cobra.Command) (*client.Client, error) {
 			s.savedServer, s.server, s.server)
 	}
 	if s.token == "" {
-		return nil, fmt.Errorf(`not logged in to %s; run "charlie login" or set CHARLIE_TOKEN`, s.server)
+		return nil, fmt.Errorf(`not logged in to %s; run %q or set CHARLIE_TOKEN`, s.server, loginCommand(s.server, s.fileServer))
 	}
 	g.savedLogin = s.fromFile
 	return g.newClient(s.server, s.token), nil

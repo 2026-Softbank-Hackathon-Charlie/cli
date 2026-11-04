@@ -41,7 +41,7 @@ type pendingLogin struct {
 // directory.
 func (a *App) configDir() (string, error) {
 	if d := a.Getenv("CHARLIE_CONFIG_DIR"); d != "" {
-		// Absolute, so the background updater finds the same directory.
+		// Absolute, so the paths charlie prints say where the files are.
 		return filepath.Abs(d)
 	}
 	d, err := a.ConfigDir()
@@ -50,6 +50,12 @@ func (a *App) configDir() (string, error) {
 	}
 	return filepath.Join(d, "charlie"), nil
 }
+
+// ownConfigDir reports whether the config directory is charlie's own (the
+// default one), which it tightens to 0700. A CHARLIE_CONFIG_DIR may be a
+// shared volume owned by someone else; there the 0600 files protect the
+// secrets.
+func (a *App) ownConfigDir() bool { return a.Getenv("CHARLIE_CONFIG_DIR") == "" }
 
 // loadConfig returns an empty config when the file does not exist.
 func loadConfig(path string) (config, error) {
@@ -84,22 +90,27 @@ func loadPending(path string) (*pendingLogin, error) {
 	return &p, nil
 }
 
-func saveConfig(path string, c config) error { return writePrivate(path, c) }
+func saveConfig(path string, c config, ownDir bool) error { return writePrivate(path, c, ownDir) }
 
-func savePending(path string, p *pendingLogin) error { return writePrivate(path, p) }
+func savePending(path string, p *pendingLogin, ownDir bool) error {
+	return writePrivate(path, p, ownDir)
+}
 
-// writePrivate writes v as JSON, 0600 in a 0700 directory, since both files
-// hold secrets. It renames a temporary file into place so a crash never
-// leaves a half-written file, and a pre-existing file never keeps wider
-// permissions.
-func writePrivate(path string, v any) error {
+// writePrivate writes v as JSON with mode 0600, since both files hold
+// secrets. A directory it creates is 0700, and so is an existing one when
+// ownDir says it is charlie's own. It renames a temporary file into place so
+// a crash never leaves a half-written file, and a pre-existing file never
+// keeps wider permissions.
+func writePrivate(path string, v any, ownDir bool) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	// MkdirAll leaves an existing directory's mode alone.
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
+	if ownDir {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
 	}
 	b, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {

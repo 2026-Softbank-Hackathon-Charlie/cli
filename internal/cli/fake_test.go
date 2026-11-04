@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -32,12 +33,16 @@ type fakeServer struct {
 	conns  int
 
 	// Device login. Each POST /v1/auth/device starts a new one with the
-	// device code fakeDeviceCode(n) and the user code fakeUserCodes[n];
-	// devicePoll answers the n-th poll for a device code with "pending"
-	// (also when nil), "approved", "denied", "expired", "500" or "drop" (a
-	// broken connection).
+	// device code fakeDeviceCode(n), the user code fakeUserCodes[n] and
+	// interval (5 when 0). devicePoll answers the n-th poll for a device
+	// code with "pending" (also when nil), "approved", "denied", "expired",
+	// "500", "403" (a proxy's HTML page), "notoken" (200 without a token) or
+	// "drop" (a broken connection). Like the server, a device code that
+	// handed out its token answers expired_token from then on.
 	starts     int
+	interval   int
 	polls      map[string]int
+	exchanged  map[string]bool
 	devicePoll func(deviceCode string, n int) string
 }
 
@@ -64,35 +69,45 @@ type fakeReq struct {
 
 func newFake(t *testing.T, token string) *fakeServer {
 	t.Helper()
-	f := &fakeServer{token: token, polls: map[string]int{}}
+	f := &fakeServer{token: token, polls: map[string]int{}, exchanged: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, apiv1.Principal{Name: "alice", Role: apiv1.RoleOperator})
 	})
 	mux.HandleFunc("POST /v1/auth/device", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
-		n := f.starts
+		n, interval := f.starts, cmp.Or(f.interval, 5)
 		f.starts++
 		f.mu.Unlock()
 		writeJSON(w, 200, apiv1.DeviceLoginStart{DeviceCode: fakeDeviceCode(n), UserCode: fakeUserCodes[n%len(fakeUserCodes)],
-			VerificationUri: "https://console.hopcharlie.dev/#device", ExpiresIn: 600, Interval: 5})
+			VerificationUri: "https://console.hopcharlie.dev/#device", ExpiresIn: 600, Interval: interval})
 	})
 	mux.HandleFunc("POST /v1/auth/device/token", func(w http.ResponseWriter, r *http.Request) {
 		var req apiv1.DeviceTokenRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.mu.Lock()
-		n, script := f.polls[req.DeviceCode], f.devicePoll
+		n, script, used := f.polls[req.DeviceCode], f.devicePoll, f.exchanged[req.DeviceCode]
 		f.polls[req.DeviceCode]++
 		f.mu.Unlock()
 		answer := "pending"
 		if script != nil {
 			answer = script(req.DeviceCode, n)
 		}
+		if used {
+			answer = "expired"
+		}
 		switch answer {
 		case "pending":
 			writeError(w, 400, "authorization_pending", "not approved yet; ask again in 5 seconds")
-		case "approved":
-			writeJSON(w, 200, apiv1.Session{Token: fakeCLIToken(req.DeviceCode), ExpiresAt: fakeTokenExpiry,
+		case "approved", "notoken":
+			f.mu.Lock()
+			f.exchanged[req.DeviceCode] = true
+			f.mu.Unlock()
+			token := fakeCLIToken(req.DeviceCode)
+			if answer == "notoken" {
+				token = ""
+			}
+			writeJSON(w, 200, apiv1.Session{Token: token, ExpiresAt: fakeTokenExpiry,
 				Principal: apiv1.Principal{Name: "alice", Role: apiv1.RoleAgent}})
 		case "denied":
 			writeError(w, 400, "access_denied", "an administrator denied this device login")
@@ -100,6 +115,10 @@ func newFake(t *testing.T, token string) *fakeServer {
 			writeError(w, 400, "expired_token", "the device login is unknown, expired or already used; start a new one")
 		case "500":
 			writeError(w, 500, "internal", "internal error")
+		case "403":
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(403)
+			fmt.Fprint(w, "<html><body>Forbidden by proxy</body></html>")
 		case "drop":
 			panic(http.ErrAbortHandler)
 		}

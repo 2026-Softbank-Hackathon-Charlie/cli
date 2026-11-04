@@ -157,7 +157,7 @@ func TestLoginNoWaitThenResume(t *testing.T) {
 	r := h.run("", "login", "--no-wait").ok(t)
 	noSecrets(t, r)
 	if want := instructions("BCDF-GHJK", t0.Add(10*time.Minute), "in 10 minutes") +
-		`After approving, run "charlie login" to finish.` + "\n"; r.stdout != want {
+		`After approving, run "charlie login --server ` + f.URL + `" to finish.` + "\n"; r.stdout != want {
 		t.Errorf("stdout:\n%s\nwant:\n%s", r.stdout, want)
 	}
 	if n := len(f.pollsMade()); n != 0 || len(h.slept) != 0 {
@@ -207,11 +207,265 @@ func TestLoginNoWaitThenResume(t *testing.T) {
 		t.Errorf("config = %+v", cfg)
 	}
 	gone(t, h.pendingFile())
+}
 
-	// --server is part of the command that finishes the login.
-	h2 := newHarness(t, nil)
-	if r := h2.run("", "login", "--server", f.URL, "--no-wait").ok(t); !strings.Contains(r.stdout, `run "charlie login --server `+f.URL+`" to finish`) {
-		t.Errorf("--server hint:\n%s", r.stdout)
+// The hints say "charlie login --server URL" whenever plain "charlie login"
+// would go elsewhere: to the saved login's server, else the default.
+func TestLoginHintsNameTheServer(t *testing.T) {
+	a, b := newFake(t, ""), newFake(t, "")
+	h := newHarness(t, nil)
+	exp := fakeTokenExpiry
+	if err := saveConfig(h.configFile(), config{Server: a.URL, Token: "a-token", ExpiresAt: &exp}, true); err != nil {
+		t.Fatal(err)
+	}
+	if r := h.run("", "login", "--no-wait").ok(t); !strings.Contains(r.stdout, `run "charlie login" to finish`) {
+		t.Errorf("saved server:\n%s", r.stdout)
+	}
+	h.env["CHARLIE_SERVER"] = b.URL
+	if r := h.run("", "login", "--no-wait").ok(t); !strings.Contains(r.stdout, `run "charlie login --server `+b.URL+`" to finish`) {
+		t.Errorf("CHARLIE_SERVER elsewhere:\n%s", r.stdout)
+	}
+
+	h2 := newHarness(t, map[string]string{"CHARLIE_SERVER": b.URL})
+	if r := h2.run("", "whoami"); r.code != ExitError ||
+		!strings.Contains(r.stderr, `not logged in to `+b.URL+`; run "charlie login --server `+b.URL+`" or set CHARLIE_TOKEN`) {
+		t.Errorf("whoami: exit %d, %q", r.code, r.stderr)
+	}
+}
+
+// A code someone already approved: --no-wait saves the token instead of
+// printing the code, since the server hands it out only once.
+func TestLoginNoWaitSavesApprovedPending(t *testing.T) {
+	for _, json := range []bool{false, true} {
+		f := newFake(t, "")
+		f.devicePoll = pollScript("approved")
+		h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+		oldPending(t, h, f.URL)
+		args := []string{"login", "--no-wait"}
+		if json {
+			args = append([]string{"--json"}, args...)
+		}
+		r := h.run("", args...).ok(t)
+		noSecrets(t, r)
+		if json {
+			if res := decodeOut[map[string]any](t, r.stdout); res["name"] != "alice" || res["role"] != "agent" || res["userCode"] != nil {
+				t.Errorf("--json = %v", res)
+			}
+		} else if !strings.HasPrefix(r.stdout, "Logged in to "+f.URL+" as alice (agent)") {
+			t.Errorf("stdout:\n%s", r.stdout)
+		}
+		if cfg := readFile[config](t, h.configFile()); cfg.Token != fakeCLIToken("old-secret") || f.startsMade() != 0 {
+			t.Errorf("config %+v, starts %d", cfg, f.startsMade())
+		}
+		gone(t, h.pendingFile())
+	}
+}
+
+func TestLoginDamagedFiles(t *testing.T) {
+	f := newFake(t, "")
+	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+	if err := os.MkdirAll(filepath.Dir(h.pendingFile()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// A damaged pending login is replaced by a new one.
+	if err := os.WriteFile(h.pendingFile(), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h.run("", "login", "--no-wait").ok(t)
+	if p := readFile[pendingLogin](t, h.pendingFile()); p.DeviceCode != "dev-secret-0" || f.startsMade() != 1 {
+		t.Errorf("pending %+v, starts %d", p, f.startsMade())
+	}
+
+	// A damaged config.json does not stop the login that replaces it.
+	for _, bad := range []string{"{not json", `{"server":"not a url","token":"x"}`} {
+		if err := os.WriteFile(h.configFile(), []byte(bad), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		f.devicePoll = pollScript("approved")
+		r := h.run("", "login").ok(t)
+		if !strings.Contains(r.stderr, "warning: ignoring the saved login (read "+h.configFile()) || !strings.Contains(r.stdout, "Logged in to") {
+			t.Errorf("%s: stdout %q, stderr %q", bad, r.stdout, r.stderr)
+		}
+		if cfg := readFile[config](t, h.configFile()); cfg.Server != f.URL || cfg.Token == "" {
+			t.Errorf("%s: config %+v", bad, cfg)
+		}
+	}
+}
+
+// An answer that is not about the device login, such as a proxy's 403
+// page, drops the pending login instead of failing every later login.
+func TestLoginResumeDropsPendingOnOtherErrors(t *testing.T) {
+	f := newFake(t, "")
+	f.devicePoll = func(code string, _ int) string {
+		if code == "old-secret" {
+			return "403"
+		}
+		return "pending"
+	}
+	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+	oldPending(t, h, f.URL)
+	r := h.run("", "login", "--no-wait").ok(t)
+	if !strings.Contains(r.stderr, "could not check the pending login (HTTP 403: <html><body>Forbidden by proxy</body></html>); starting a new one") || !strings.Contains(r.stdout, "    BCDF-GHJK\n") {
+		t.Errorf("stdout %q, stderr %q", r.stdout, r.stderr)
+	}
+	if p := readFile[pendingLogin](t, h.pendingFile()); p.DeviceCode != "dev-secret-0" {
+		t.Errorf("pending = %+v", p)
+	}
+}
+
+func TestLoginRejectsEmptyToken(t *testing.T) {
+	f := newFake(t, "")
+	f.devicePoll = pollScript("notoken")
+	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+	r := h.run("", "login")
+	if r.code != ExitError || !strings.Contains(r.stderr, f.URL+" approved the login but sent no token") {
+		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
+	}
+	gone(t, h.configFile())
+	gone(t, h.pendingFile())
+}
+
+func TestLoginCapsInterval(t *testing.T) {
+	f := newFake(t, "")
+	f.interval = 3600
+	f.devicePoll = pollScript("pending", "approved")
+	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+	h.run("", "login").ok(t)
+	if !slices.Equal(h.slept, []time.Duration{time.Minute, time.Minute}) {
+		t.Errorf("slept %v", h.slept)
+	}
+}
+
+// Two "charlie login" in one config directory share the pending login, and
+// the server hands out its token once.
+func TestLoginConcurrent(t *testing.T) {
+	t.Run("the other one gets the token while this one waits", func(t *testing.T) {
+		f := newFake(t, "")
+		f.devicePoll = pollScript("approved")
+		h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+		var other result
+		h.onSleep = func(n int) {
+			if n == 1 {
+				other = h.run("", "login", "--no-wait") // a bot's run, after the approval
+			}
+		}
+		r := h.run("", "login").ok(t)
+		if !strings.Contains(other.stdout, "Logged in to") {
+			t.Errorf("other login: exit %d, %q %q", other.code, other.stdout, other.stderr)
+		}
+		if !strings.Contains(r.stderr, `Another "charlie login" finished this login.`) ||
+			!strings.Contains(r.stdout, "Logged in to "+f.URL+" as alice (operator) until "+stamp(fakeTokenExpiry)+".") {
+			t.Errorf("stdout %q, stderr %q", r.stdout, r.stderr)
+		}
+		if got := f.last(t, "GET", "/v1/me").header.Get("Authorization"); got != "Bearer "+fakeCLIToken("dev-secret-0") {
+			t.Errorf("checked with %q", got)
+		}
+		if f.startsMade() != 1 {
+			t.Errorf("%d device logins started", f.startsMade())
+		}
+		gone(t, h.pendingFile())
+	})
+	t.Run("resuming after the other one got the token", func(t *testing.T) {
+		f := newFake(t, "")
+		h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+		h.run("", "login", "--no-wait").ok(t)
+		exp := fakeTokenExpiry
+		// This login read the pending file; meanwhile the other one exchanged
+		// the code, saved the token and removed the file.
+		f.devicePoll = func(string, int) string {
+			if err := saveConfig(h.configFile(), config{Server: f.URL, Token: "other-token", ExpiresAt: &exp}, true); err != nil {
+				t.Error(err)
+			}
+			_ = os.Remove(h.pendingFile())
+			return "expired"
+		}
+		r := h.run("", "login").ok(t)
+		if !strings.Contains(r.stderr, `Another "charlie login" finished this login.`) || !strings.HasPrefix(r.stdout, "Logged in to "+f.URL) {
+			t.Errorf("stdout %q, stderr %q", r.stdout, r.stderr)
+		}
+		if f.startsMade() != 1 {
+			t.Errorf("a new device login was started (%d)", f.startsMade())
+		}
+		if cfg := readFile[config](t, h.configFile()); cfg.Token != "other-token" {
+			t.Errorf("config = %+v", cfg)
+		}
+	})
+	t.Run("a newer pending login is left alone", func(t *testing.T) {
+		f := newFake(t, "")
+		f.devicePoll = pollScript("denied")
+		h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+		h.onSleep = func(n int) {
+			if n == 1 {
+				p := &pendingLogin{Server: f.URL, DeviceCode: "newer-secret", UserCode: "NEWR-CODE",
+					VerificationURI: "https://console.hopcharlie.dev/#device", ExpiresAt: t0.Add(15 * time.Minute), Interval: 5}
+				if err := savePending(h.pendingFile(), p, true); err != nil {
+					t.Error(err)
+				}
+			}
+		}
+		if r := h.run("", "login"); r.code != ExitError || !strings.Contains(r.stderr, "denied") {
+			t.Errorf("exit %d, stderr %q", r.code, r.stderr)
+		}
+		if p := readFile[pendingLogin](t, h.pendingFile()); p.DeviceCode != "newer-secret" {
+			t.Errorf("pending = %+v", p)
+		}
+	})
+}
+
+// charlie tightens its own config directory to 0700 but leaves a
+// CHARLIE_CONFIG_DIR that already exists alone: it may be a shared volume
+// owned by someone else.
+func TestConfigDirPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows has no Unix permission bits")
+	}
+	mode := func(path string) os.FileMode {
+		t.Helper()
+		fi, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	f := newFake(t, "")
+	shared := filepath.Join(t.TempDir(), "volume")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(shared, 0o755); err != nil { // whatever the umask
+		t.Fatal(err)
+	}
+	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL, "CHARLIE_CONFIG_DIR": shared})
+	f.devicePoll = pollScript("approved")
+	h.run("", "login").ok(t)
+	if m := mode(shared); m != 0o755 {
+		t.Errorf("CHARLIE_CONFIG_DIR mode %v, want it left at 0755", m)
+	}
+	if m := mode(filepath.Join(shared, configFile)); m != 0o600 {
+		t.Errorf("config.json mode %v", m)
+	}
+
+	// A CHARLIE_CONFIG_DIR that charlie creates is 0700.
+	created := filepath.Join(t.TempDir(), "new", "charlie")
+	h = newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL, "CHARLIE_CONFIG_DIR": created})
+	h.run("", "login", "--no-wait").ok(t)
+	if m := mode(created); m != 0o700 {
+		t.Errorf("created CHARLIE_CONFIG_DIR mode %v", m)
+	}
+
+	// The default directory is charlie's own: an existing one is tightened.
+	h = newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
+	own := filepath.Join(h.dir, "charlie")
+	if err := os.Mkdir(own, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(own, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	h.run("", "login", "--no-wait").ok(t)
+	if m := mode(own); m != 0o700 {
+		t.Errorf("default dir mode %v, want 0700", m)
 	}
 }
 
@@ -220,7 +474,7 @@ func oldPending(t *testing.T, h *harness, server string) {
 	t.Helper()
 	p := &pendingLogin{Server: server, DeviceCode: "old-secret", UserCode: "OLDC-ODEX",
 		VerificationURI: "https://console.hopcharlie.dev/#device", ExpiresAt: t0.Add(-5 * time.Minute), Interval: 5}
-	if err := savePending(h.pendingFile(), p); err != nil {
+	if err := savePending(h.pendingFile(), p, true); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -305,7 +559,7 @@ func TestLoginCodeExpires(t *testing.T) {
 	f.devicePoll = pollScript("pending", "expired")
 	h := newHarness(t, map[string]string{"CHARLIE_SERVER": f.URL})
 	r := h.run("", "login")
-	if r.code != ExitError || !strings.Contains(r.stderr, `error: the code BCDF-GHJK expired; "charlie login" gets a new one`) {
+	if r.code != ExitError || !strings.Contains(r.stderr, `error: the code BCDF-GHJK expired; "charlie login --server `+f.URL+`" gets a new one`) {
 		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
 	}
 	gone(t, h.pendingFile())
@@ -351,7 +605,7 @@ func TestLoginCtrlCKeepsPending(t *testing.T) {
 		}
 	}
 	r := h.runCtx(ctx, "", "login")
-	if r.code != ExitInterrupted || !strings.Contains(r.stderr, `"charlie login" resumes it with the same code`) {
+	if r.code != ExitInterrupted || !strings.Contains(r.stderr, `"charlie login --server `+f.URL+`" resumes it with the same code`) {
 		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
 	}
 	if p := readFile[pendingLogin](t, h.pendingFile()); p.DeviceCode != "dev-secret-0" {
@@ -483,7 +737,7 @@ func TestLogout(t *testing.T) {
 	exp := t0.Add(24 * time.Hour)
 	login := func(server, token string) {
 		t.Helper()
-		if err := saveConfig(h.configFile(), config{Server: server, Token: token, ExpiresAt: &exp}); err != nil {
+		if err := saveConfig(h.configFile(), config{Server: server, Token: token, ExpiresAt: &exp}, true); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -519,6 +773,18 @@ func TestLogout(t *testing.T) {
 	r = h.run("", "logout").ok(t)
 	if !strings.Contains(r.stdout, "Could not reach the server") || !strings.Contains(r.stdout, "the token stays valid until "+stamp(exp)+".") {
 		t.Errorf("server down: %q", r.stdout)
+	}
+	gone(t, h.configFile())
+
+	// A static token saved by the stdin login of older versions: no expiry,
+	// and the server cannot end it.
+	if err := saveConfig(h.configFile(), config{Server: f.URL, Token: "cli-tok"}, true); err != nil {
+		t.Fatal(err)
+	}
+	n = len(f.requests())
+	r = h.run("", "logout").ok(t)
+	if !strings.Contains(r.stdout, "on this machine only") || !strings.Contains(r.stdout, "stays valid on the server") || len(f.requests()) != n {
+		t.Errorf("static token: %q, %d requests", r.stdout, len(f.requests())-n)
 	}
 	gone(t, h.configFile())
 
@@ -562,14 +828,14 @@ func TestSavedLoginRejectedHint(t *testing.T) {
 	const hint = `The saved login expired or was revoked; run "charlie login".`
 	f := newFake(t, "fresh")
 	h := newHarness(t, nil)
-	if err := saveConfig(h.configFile(), config{Server: f.URL, Token: "stale"}); err != nil {
+	if err := saveConfig(h.configFile(), config{Server: f.URL, Token: "stale"}, true); err != nil {
 		t.Fatal(err)
 	}
 	r := h.run("", "env", "list")
 	if r.code != ExitError || !strings.HasSuffix(r.stderr, "(HTTP 401)\n"+hint+"\n") {
 		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
 	}
-	if err := saveConfig(h.configFile(), config{Server: f.URL, Token: "fresh"}); err != nil {
+	if err := saveConfig(h.configFile(), config{Server: f.URL, Token: "fresh"}, true); err != nil {
 		t.Fatal(err)
 	}
 	if r := h.run("", "env", "show", "nope"); r.code != ExitError || strings.Contains(r.stderr, hint) {

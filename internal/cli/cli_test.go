@@ -43,7 +43,7 @@ func TestSettingsPrecedence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, tc.env)
 			saved := cmp.Or(tc.saved, a.URL)
-			if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: saved, Token: "file-token"}); err != nil {
+			if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: saved, Token: "file-token"}, true); err != nil {
 				t.Fatal(err)
 			}
 			before := map[*fakeServer]int{a: len(a.requests()), b: len(b.requests()), c: len(c.requests())}
@@ -72,7 +72,7 @@ func TestSettingsPrecedence(t *testing.T) {
 
 	// Logging in to the other server still works, and replaces the saved login.
 	h := newHarness(t, nil)
-	if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: a.URL, Token: "file-token"}); err != nil {
+	if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: a.URL, Token: "file-token"}, true); err != nil {
 		t.Fatal(err)
 	}
 	c.devicePoll = pollScript("approved")
