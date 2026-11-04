@@ -24,7 +24,7 @@ type fakeSecret struct {
 }
 
 // fakeSecretLimit stands in for the server's 50 secrets per scope.
-const fakeSecretLimit = 5
+const fakeSecretLimit = 8
 
 // fixtureSecrets: two app-wide secrets, and moimroom--dev overrides one of
 // them and has one of its own.
@@ -376,6 +376,21 @@ func TestAppSecretGet(t *testing.T) {
 		t.Errorf("--json: %s, stderr %q", r.stdout, r.stderr)
 	}
 
+	// Without an override the instance gets the app-wide value, and stderr
+	// says so.
+	gets := f.sent("GET", "/v1/apps/moimroom/secrets/ADMIN_TOKEN")
+	r = h.run("", "app", "secret", "get", "moimroom", "ADMIN_TOKEN", "--instance", "dev").ok(t)
+	if r.stdout != "adm-s3cret-value\n" || r.stderr != "note: instance moimroom--dev does not override ADMIN_TOKEN; this is the app-wide value it inherits\n" {
+		t.Errorf("inherited: stdout %q, stderr %q", r.stdout, r.stderr)
+	}
+	if n := f.sent("GET", "/v1/apps/moimroom/secrets/ADMIN_TOKEN") - gets; n != 2 || f.last(t, "GET", "/v1/apps/moimroom/secrets/ADMIN_TOKEN").query != "" {
+		t.Errorf("inherited: %d reads, the last with query %q", n, f.last(t, "GET", "/v1/apps/moimroom/secrets/ADMIN_TOKEN").query)
+	}
+	r = h.run("", "--json", "app", "secret", "get", "moimroom", "ADMIN_TOKEN", "--instance", "dev").ok(t)
+	if v := decodeOut[apiv1.AppSecretValue](t, r.stdout); v.Value != "adm-s3cret-value" || v.Instance != nil || !strings.HasPrefix(r.stderr, "note: ") {
+		t.Errorf("inherited --json: %s, stderr %q", r.stdout, r.stderr)
+	}
+
 	// A value is printed as it is, also when it looks like a status marker.
 	f.mu.Lock()
 	f.secrets[""]["MARKED"] = fakeSecret{value: "[ok] two  spaces\tand tab", by: "alice", at: t0}
@@ -423,12 +438,25 @@ func TestAppSecretSetStdin(t *testing.T) {
 	}
 	noValues(t, "set --instance", r, "dev-s3cret-3")
 
-	// Only the line break at the end goes.
+	// Only the line break at the end goes, and a UTF-8 byte order mark.
 	h.run("  spaced\t value  \n", "app", "secret", "set", "moimroom", "SPACED", "--stdin").ok(t)
 	if v, _ := f.stored("", "SPACED"); v != "  spaced\t value  " {
 		t.Errorf("stored %q", v)
 	}
-	h.run(strings.Repeat("x", 4096)+"\n", "app", "secret", "set", "moimroom", "LONGEST", "--stdin").ok(t)
+	h.run("\xEF\xBB\xBFbom-value\r\n", "app", "secret", "set", "moimroom", "BOM", "--stdin").ok(t)
+	if v, _ := f.stored("", "BOM"); v != "bom-value" {
+		t.Errorf("stored %q", v)
+	}
+	h.run("\xEF\xBB\xBF"+strings.Repeat("x", 4096)+"\r\n", "app", "secret", "set", "moimroom", "LONGEST", "--stdin").ok(t)
+
+	// --stdin=false is no input: without a terminal it is refused.
+	if r := h.run("v\n", "app", "secret", "set", "moimroom", "HOST_CODE", "--stdin=false"); r.code != ExitUsage || !strings.Contains(r.stderr, "stdin is not a terminal") {
+		t.Errorf("--stdin=false: exit %d, stderr %q", r.code, r.stderr)
+	}
+	h.run("", "app", "secret", "set", "moimroom", "FROM_FILE", "--stdin=false", "--from-file", writeTemp(t, "v", "file-value\n")).ok(t)
+	if v, _ := f.stored("", "FROM_FILE"); v != "file-value" {
+		t.Errorf("--stdin=false --from-file: stored %q", v)
+	}
 
 	puts := f.sent("PUT", "/v1/apps/moimroom/secrets")
 	for _, tc := range []struct{ stdin, want string }{
@@ -438,6 +466,9 @@ func TestAppSecretSetStdin(t *testing.T) {
 		{strings.Repeat("x", 4097), "error: the value of HOST_CODE is longer than 4096 bytes; nothing was set\n"},
 		{strings.Repeat("x", 100000), "error: the value of HOST_CODE is longer than 4096 bytes; nothing was set\n"},
 		{"bad\xff\xfe", "error: the value of HOST_CODE is not UTF-8 text; nothing was set\n"},
+		{"nul\x00value\n", "error: the value of HOST_CODE has a NUL byte, which an environment variable cannot hold; nothing was set\n"},
+		{"\xFF\xFEv\x00a\x00l\x00\n\x00", "error: stdin is UTF-16; send the value as UTF-8\n"},
+		{"\xFE\xFF\x00v\x00a\x00l", "error: stdin is UTF-16; send the value as UTF-8\n"},
 	} {
 		r := h.run(tc.stdin, "app", "secret", "set", "moimroom", "HOST_CODE", "--stdin")
 		if r.code != ExitError || r.stderr != tc.want || r.stdout != "" {
@@ -482,6 +513,27 @@ func TestAppSecretSetPrompt(t *testing.T) {
 	if r := h.run("", "app", "secret", "set", "moimroom", "HOST_CODE"); r.code != ExitError || !strings.HasSuffix(r.stderr, "error: the value of HOST_CODE is empty; nothing was set\n") {
 		t.Errorf("empty: exit %d, stderr %q", r.code, r.stderr)
 	}
+
+	// --stdin on a terminal would show the value as it is typed.
+	reqs := len(f.requests())
+	r = h.run("", "app", "secret", "set", "moimroom", "HOST_CODE", "--stdin")
+	if r.code != ExitUsage || !strings.Contains(r.stderr, "--stdin is for a piped value, but stdin is a terminal") || len(f.requests()) != reqs {
+		t.Errorf("--stdin on a terminal: exit %d, stderr %q", r.code, r.stderr)
+	}
+
+	// Ctrl-C at the prompt ends it even when a line follows.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	readHidden = func(context.Context, io.Reader) ([]byte, error) {
+		cancel()
+		return []byte("late-value"), nil
+	}
+	puts := f.sent("PUT", "/v1/apps/moimroom/secrets")
+	r = h.runCtx(ctx, "", "app", "secret", "set", "moimroom", "HOST_CODE")
+	if r.code != ExitInterrupted || f.sent("PUT", "/v1/apps/moimroom/secrets") != puts {
+		t.Errorf("Ctrl-C: exit %d, stderr %q", r.code, r.stderr)
+	}
+	noValues(t, "Ctrl-C", r, "late-value")
 }
 
 func TestAppSecretSetFromFile(t *testing.T) {
@@ -490,11 +542,12 @@ func TestAppSecretSetFromFile(t *testing.T) {
 
 	// The file as it is, without one line break at its end.
 	for content, want := range map[string]string{
-		"line1\nline2\n":   "line1\nline2",
-		"pem\r\n":          "pem",
-		"two breaks\n\n":   "two breaks\n",
-		"no break":         "no break",
-		" keep spaces \t ": " keep spaces \t ",
+		"line1\nline2\n":      "line1\nline2",
+		"pem\r\n":             "pem",
+		"two breaks\n\n":      "two breaks\n",
+		"no break":            "no break",
+		" keep spaces \t ":    " keep spaces \t ",
+		"\xEF\xBB\xBFbom\r\n": "bom",
 	} {
 		r := h.run("", "app", "secret", "set", "moimroom", "CERT", "--from-file", writeTemp(t, "cert.pem", content)).ok(t)
 		if v, _ := f.stored("", "CERT"); v != want {
@@ -502,14 +555,19 @@ func TestAppSecretSetFromFile(t *testing.T) {
 		}
 		noValues(t, "--from-file", r, "line1", "line2", "keep spaces")
 	}
-	h.run("", "app", "secret", "set", "moimroom", "CERT", "--from-file", writeTemp(t, "max", strings.Repeat("a", 4096)+"\n")).ok(t)
+	h.run("", "app", "secret", "set", "moimroom", "CERT", "--from-file", writeTemp(t, "max", "\xEF\xBB\xBF"+strings.Repeat("a", 4096)+"\r\n")).ok(t)
 
 	puts := f.sent("PUT", "/v1/apps/moimroom/secrets")
 	big := writeTemp(t, "big", strings.Repeat("a", 4097))
+	le := writeTemp(t, "le.txt", "\xFF\xFEs\x00e\x00c\x00\r\x00\n\x00")
+	be := writeTemp(t, "be.txt", "\xFE\xFF\x00s\x00e\x00c")
 	for file, want := range map[string]string{
 		big:                                 "error: " + big + " holds more than 4096 bytes, the most a secret value can have\n",
 		writeTemp(t, "empty", ""):           "error: the value of CERT is empty; nothing was set\n",
-		writeTemp(t, "bin", "\x00\xff\x01"): "error: the value of CERT is not UTF-8 text; nothing was set\n",
+		writeTemp(t, "bin", "\x01\xff\x02"): "error: the value of CERT is not UTF-8 text; nothing was set\n",
+		writeTemp(t, "nul-byte", "a\x00b"):  "error: the value of CERT has a NUL byte, which an environment variable cannot hold; nothing was set\n",
+		le:                                  "error: " + le + " is UTF-16; save it as UTF-8\n",
+		be:                                  "error: " + be + " is UTF-16; save it as UTF-8\n",
 	} {
 		if r := h.run("", "app", "secret", "set", "moimroom", "CERT", "--from-file", file); r.code != ExitError || r.stderr != want {
 			t.Errorf("%s: exit %d, stderr %q", file, r.code, r.stderr)
@@ -545,22 +603,65 @@ func TestAppSecretSetEnvFile(t *testing.T) {
 		t.Errorf("--instance body %s", body)
 	}
 
-	// Every bad line, by number, and no value.
-	puts := f.sent("PUT", "/v1/apps/moimroom/secrets")
-	bad := writeTemp(t, "bad.env", "GOOD=fine-value\njust-a-secret-line\nlower=bad-name-value\nPORT=8080\nGOOD=again-value\nEMPTY=\nS3_BUCKET=bucket-value\nSPACE =space-value\n")
+	// A UTF-8 byte order mark is dropped; UTF-16 is refused.
+	h.run("", "app", "secret", "set", "moimroom", "--env-file", writeTemp(t, "bom.env", "\xEF\xBB\xBFBOM_KEY=bom-env-value\r\n")).ok(t)
+	if v, _ := f.stored("", "BOM_KEY"); v != "bom-env-value" {
+		t.Errorf("BOM: stored %q", v)
+	}
+
+	// Every bad line, by number, before any request. The text before "="
+	// is printed only when it is a well-formed name: on other lines it may
+	// be a secret.
+	reqs := len(f.requests())
+	longToken := "eyJhbGciOiJIUzI1NiJ9" + strings.Repeat("x", 60)
+	bad := writeTemp(t, "bad.env", "GOOD=fine-value\n"+
+		"just-a-secret-line\n"+
+		"lower=bad-name-value\n"+
+		"PORT=8080\n"+
+		"GOOD=again-value\n"+
+		"EMPTY=\n"+
+		"S3_BUCKET=bucket-value\n"+
+		"SPACE =space-value\n"+
+		"ADMIN_TOKEN: dGhpcyBpcyBhIHNlY3JldA==\n"+ // YAML
+		"db.password=hunter2-prop\n"+ // properties
+		"postgres://app:p4ss-conn@db.internal:5432/app?sslmode=require\n"+ // connection string
+		"export API_KEY=export-value\n"+
+		"Authorization: Bearer "+longToken+"=\n"+
+		strings.Repeat("A", 65)+"=long-name-value\n"+
+		"NUL_KEY=a\x00b\n")
 	r = h.run("", "app", "secret", "set", "moimroom", "--env-file", bad)
+	const notName = `not NAME=value: the text before the first "=" does not match ^[A-Z_][A-Z0-9_]*$`
 	want := "error: " + bad + ": nothing was set:\n" +
 		"  line 2: want NAME=value\n" +
-		`  line 3: secret name "lower" must match ^[A-Z_][A-Z0-9_]*$` + "\n" +
+		"  line 3: " + notName + "\n" +
 		"  line 4: secret name PORT is set by the platform (PORT, DATABASE_URL and S3_* are reserved)\n" +
 		"  line 5: GOOD is already set on line 1\n" +
 		"  line 6: the value of EMPTY is empty\n" +
 		"  line 7: secret name S3_BUCKET is set by the platform (PORT, DATABASE_URL and S3_* are reserved)\n" +
-		`  line 8: secret name "SPACE " must match ^[A-Z_][A-Z0-9_]*$` + "\n"
+		"  line 8: " + notName + "\n" +
+		"  line 9: " + notName + "\n" +
+		"  line 10: " + notName + "\n" +
+		"  line 11: " + notName + "\n" +
+		"  line 12: " + notName + "\n" +
+		"  line 13: " + notName + "\n" +
+		"  line 14: the name is longer than 64 characters\n" +
+		"  line 15: the value of NUL_KEY has a NUL byte, which an environment variable cannot hold\n"
 	if r.code != ExitError || r.stderr != want || r.stdout != "" {
 		t.Errorf("bad lines: exit %d\nstderr:\n%s\nwant:\n%s", r.code, r.stderr, want)
 	}
-	noValues(t, "bad env file", r, "fine-value", "just-a-secret-line", "bad-name-value", "8080", "again-value", "bucket-value", "space-value")
+	noValues(t, "bad env file", r, "fine-value", "just-a-secret", "lower", "bad-name-value", "8080", "again-value", "bucket-value",
+		"space-value", "SPACE ", "dGhpcyBpcyBhIHNlY3JldA", "ADMIN_TOKEN:", "hunter2-prop", "db.password", "p4ss-conn", "postgres://",
+		"export", "eyJhbGciOiJIUzI1NiJ9", "Bearer", "AAAAAAAAAAAAAAAAAAAA", "long-name-value")
+	if n := len(f.requests()) - reqs; n != 0 {
+		t.Errorf("bad env file: sent %d requests", n)
+	}
+	puts := f.sent("PUT", "/v1/apps/moimroom/secrets")
+	for _, content := range []string{"\xFF\xFEH\x00=\x00v\x00", "\xFE\xFF\x00H\x00=\x00v"} {
+		file := writeTemp(t, "utf16.env", content)
+		if r := h.run("", "app", "secret", "set", "moimroom", "--env-file", file); r.code != ExitError || r.stderr != "error: "+file+" is UTF-16; save it as UTF-8\n" {
+			t.Errorf("UTF-16 env file: exit %d, stderr %q", r.code, r.stderr)
+		}
+	}
 
 	var many strings.Builder
 	for i := range 51 {
@@ -579,7 +680,7 @@ func TestAppSecretSetEnvFile(t *testing.T) {
 	}
 
 	// The server's own 400 still comes through.
-	r = h.run("", "app", "secret", "set", "moimroom", "--env-file", writeTemp(t, "more.env", "K1=v1-value\nK2=v2-value\nK3=v3-value\nK4=v4-value\n"))
+	r = h.run("", "app", "secret", "set", "moimroom", "--env-file", writeTemp(t, "more.env", "K1=v1-value\nK2=v2-value\nK3=v3-value\nK4=v4-value\nK5=v5-value\nK6=v6-value\n"))
 	if r.code != ExitError || r.stderr != "error: invalid_request: too many secrets: at most 50 app-wide and 50 per instance; delete some first (HTTP 400)\n" {
 		t.Errorf("server 400: exit %d, stderr %q", r.code, r.stderr)
 	}
@@ -715,8 +816,8 @@ func TestAppSecretErrors(t *testing.T) {
 	}{
 		{"", "get moimroom DEV_ONLY", "error: secret_not_found: app moimroom has no secret \"DEV_ONLY\" app-wide (HTTP 404)\n" +
 			"See the secrets with: charlie app secret list moimroom\n"},
-		{"", "get moimroom ADMIN_TOKEN --instance dev", "error: secret_not_found: app moimroom has no secret \"ADMIN_TOKEN\" in instance moimroom--dev (HTTP 404)\n" +
-			"Without --instance, get reads the app-wide value; see what instance moimroom--dev gets with: charlie app secret list moimroom --instance moimroom--dev\n"},
+		{"", "get moimroom NOPE --instance dev", "error: secret_not_found: app moimroom has no secret \"NOPE\" in instance moimroom--dev (HTTP 404)\n" +
+			"There is no app-wide NOPE either; see what instance moimroom--dev gets with: charlie app secret list moimroom --instance moimroom--dev\n"},
 		{"", "get nope HOST_CODE", "error: app_not_found: app not found (HTTP 404)\n"},
 		{"", "list shop", "error: app_not_registered: app shop is only in PLATFORM_APPS_FILE; register it from GitHub (POST /v1/apps) to deploy it (HTTP 409)\n"},
 		{"", "get shop HOST_CODE", "error: app_not_registered: app shop is only in PLATFORM_APPS_FILE; register it from GitHub (POST /v1/apps) to deploy it (HTTP 409)\n"},
@@ -798,7 +899,9 @@ func TestDeployRedeploy(t *testing.T) {
 			"A redeploy repeats the instance's last healthy deployment, and it has none; deploy it with a build: charlie deploy moimroom\n"},
 		{"deployment_in_progress", "", "error: deployment_in_progress: instance moimroom has a deployment that has not finished (HTTP 409)\n" +
 			"Wait until that deployment ends, then redeploy; see it with: charlie deploy list moimroom\n"},
-		{"deployment_in_progress", "--branch dev --watch", "error: deployment_in_progress: instance moimroom--dev has a deployment that has not finished (HTTP 409)\n" +
+		{"nothing_to_redeploy", "--branch dev --env eks --env gke", "error: nothing_to_redeploy: instance moimroom--dev has no healthy deployment to deploy again (HTTP 409)\n" +
+			"A redeploy repeats the instance's last healthy deployment, and it has none; deploy it with a build: charlie deploy moimroom --branch dev --env eks,gke\n"},
+		{"deployment_in_progress", "--branch dev --watch --env eks", "error: deployment_in_progress: instance moimroom--dev has a deployment that has not finished (HTTP 409)\n" +
 			"Wait until that deployment ends, then redeploy; see it with: charlie deploy list moimroom --branch dev\n"},
 	} {
 		f.mu.Lock()
@@ -808,6 +911,16 @@ func TestDeployRedeploy(t *testing.T) {
 		if r.code != ExitError || r.stderr != tc.want || r.stdout != "" {
 			t.Errorf("%s %s: exit %d\nstderr %q\nwant   %q", tc.code, tc.args, r.code, r.stderr, tc.want)
 		}
+	}
+
+	// A server from before redeploy ignores the flag and queues a build.
+	f.mu.Lock()
+	f.redeployCode = "ignore"
+	f.mu.Unlock()
+	r = h.run("", "deploy", "moimroom", "--redeploy").ok(t)
+	if want := "warning: the server queued a manual deployment, not a redeploy; it does not know --redeploy, so this deployment builds the head of the branch\n"; r.stderr != want ||
+		!strings.HasPrefix(r.stdout, "Queued deployment dep_2 ") {
+		t.Errorf("old server: stdout %q\nstderr %q", r.stdout, r.stderr)
 	}
 }
 

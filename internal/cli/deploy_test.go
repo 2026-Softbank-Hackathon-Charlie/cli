@@ -37,7 +37,8 @@ type deployFake struct {
 	conns  int
 	added  []apiv1.AppInstance // instances of moimroom added since the fixture
 
-	// redeployCode, when set, is the 409 error code of every redeploy.
+	// redeployCode, when set, is the 409 error code of every redeploy, or
+	// "ignore" to queue a build as a server without redeploy would.
 	redeployCode string
 	// App secrets of moimroom, by instance ("" app-wide) and name; nil
 	// answers 503 secrets_not_configured. See secretRoutes.
@@ -180,7 +181,9 @@ func newDeployFake(t *testing.T) *deployFake {
 				writeError(w, 409, code, "instance "+d.Instance+" has a deployment that has not finished")
 				return
 			}
-			d.Trigger = apiv1.DeploymentTriggerRedeploy
+			if code != "ignore" { // "ignore": a server from before redeploy
+				d.Trigger = apiv1.DeploymentTriggerRedeploy
+			}
 		}
 		if req.Ref != nil {
 			d.Ref = *req.Ref

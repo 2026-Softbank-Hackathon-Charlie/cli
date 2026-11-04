@@ -619,10 +619,13 @@ it failed or a newer deployment of the instance superseded it.`,
 			defer cancel()
 			d, err := c.CreateDeployment(ctx, args[0], req)
 			if err != nil && redeploy {
-				return redeployError(err, args[0], req.Branch)
+				return redeployError(err, args[0], req.Branch, envs)
 			}
 			if err != nil {
 				return err
+			}
+			if redeploy && d.Trigger != apiv1.DeploymentTriggerRedeploy {
+				fmt.Fprintf(g.app.Stderr, "warning: the server queued a %s deployment, not a redeploy; it does not know --redeploy, so this deployment builds the head of the branch\n", d.Trigger)
 			}
 			p := g.out()
 			switch {
@@ -653,16 +656,20 @@ it failed or a newer deployment of the instance superseded it.`,
 	return cmd
 }
 
-// redeployError says what to do when a redeploy is refused. branch is the
-// --branch given, if any.
-func redeployError(err error, app string, branch *string) error {
+// redeployError says what to do when a redeploy is refused. branch and envs
+// are the --branch and --env given, if any.
+func redeployError(err error, app string, branch *string, envs []string) error {
 	flag := ""
 	if branch != nil {
 		flag = " --branch " + *branch
 	}
+	envFlag := ""
+	if len(envs) > 0 {
+		envFlag = " --env " + strings.Join(envs, ",")
+	}
 	switch client.ErrorCode(err) {
 	case "nothing_to_redeploy":
-		return fmt.Errorf("%w\nA redeploy repeats the instance's last healthy deployment, and it has none; deploy it with a build: charlie deploy %s%s", err, app, flag)
+		return fmt.Errorf("%w\nA redeploy repeats the instance's last healthy deployment, and it has none; deploy it with a build: charlie deploy %s%s%s", err, app, flag, envFlag)
 	case "deployment_in_progress":
 		return fmt.Errorf("%w\nWait until that deployment ends, then redeploy; see it with: charlie deploy list %s%s", err, app, flag)
 	}

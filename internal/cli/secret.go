@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -69,7 +70,7 @@ instance). Role viewer.`,
 			defer cancel()
 			s, err := c.ListAppSecrets(ctx, app)
 			if err != nil {
-				return secretError(err, app, "", "")
+				return secretError(err, app)
 			}
 			if in == nil {
 				return show(g, s, func(s *apiv1.AppSecrets) string { return renderSecrets(app, s) })
@@ -87,13 +88,14 @@ func (g *globals) appSecretGetCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "get APP NAME",
 		Short: "Print one secret's value (role operator)",
-		Long: `Prints the value of the app-wide secret NAME, or with --instance that
-instance's override of it, and nothing else, so that it can be piped or
-captured: VALUE=$(charlie app secret get APP NAME). "charlie app secret list
-APP --instance INSTANCE" shows whether an instance overrides a secret. --json
-prints the name, the value, the instance and when and by whom it was set.
-When stdout is a terminal it warns on stderr that the value is on the screen.
-The platform records every read in the audit log, without the value.`,
+		Long: `Prints the value of the app-wide secret NAME followed by a line break, and
+nothing else, so that it can be piped or captured: VALUE=$(charlie app secret
+get APP NAME). With --instance it prints the value that instance gets: its
+override, or else the app-wide value, which it says on stderr. --json prints
+the name, the value, the instance whose override it is (none for an app-wide
+value) and when and by whom it was set. When stdout is a terminal it warns on
+stderr that the value is on the screen. The platform records every read in the
+audit log, without the value.`,
 		Args: exactArgs("APP", "NAME"),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			app, name := args[0], args[1]
@@ -118,8 +120,20 @@ The platform records every read in the audit log, without the value.`,
 			ctx, cancel := callCtx(cmd)
 			defer cancel()
 			v, err := c.GetAppSecret(ctx, app, name, inName)
+			if inName != "" && client.ErrorCode(err) == "secret_not_found" {
+				// No override: the instance gets the app-wide value.
+				var appErr error
+				v, appErr = c.GetAppSecret(ctx, app, name, "")
+				switch {
+				case client.ErrorCode(appErr) == "secret_not_found":
+					return fmt.Errorf("%w\nThere is no app-wide %s either; see what instance %s gets with: charlie app secret list %s --instance %s", err, name, inName, app, inName)
+				case appErr == nil:
+					fmt.Fprintf(g.app.Stderr, "note: instance %s does not override %s; this is the app-wide value it inherits\n", inName, name)
+				}
+				err = appErr
+			}
 			if err != nil {
-				return secretError(err, app, inName, name)
+				return secretError(err, app)
 			}
 			if isTerminal(g.app.Stdout) {
 				fmt.Fprintf(g.app.Stderr, "warning: the value of %s is shown on the screen\n", name)
@@ -146,7 +160,8 @@ func (g *globals) appSecretSetCmd() *cobra.Command {
 		Long: `Sets the app-wide secret NAME, or with --instance that instance's override of
 it. The value is never taken from the command line, where it would stay in
 the shell history: by default charlie asks for it without showing what you
-type; --stdin reads one line from stdin (the line break at its end is dropped,
+type (in Git Bash's mintty, run charlie with winpty or pipe the value);
+--stdin reads one line piped to stdin (the line break at its end is dropped,
 everything else is kept); --from-file reads a file as it is, without one line
 break at its end.
 
@@ -157,7 +172,8 @@ number before anything is sent.
 
 Names match ^[A-Z_][A-Z0-9_]*$, have at most 64 characters, and are not PORT,
 DATABASE_URL or S3_*, which the platform sets. Values are 1 to 4096 bytes of
-UTF-8 text. One change sets at most 50 names. A secret wins over a
+UTF-8 text without NUL bytes; a UTF-8 byte order mark at the start is dropped
+and UTF-16 is refused. One change sets at most 50 names. A secret wins over a
 platform.yaml env entry of the same name. Running instances keep the old
 values until they are deployed again; charlie prints the "charlie deploy
 --redeploy" commands that apply them without a build.`,
@@ -174,8 +190,8 @@ values until they are deployed again; charlie prints the "charlie deploy
 			app := args[0]
 			fl := cmd.Flags()
 			sources := 0
-			for _, f := range []string{"stdin", "from-file", "env-file"} {
-				if fl.Changed(f) {
+			for _, given := range []bool{fromStdin, fl.Changed("from-file"), fl.Changed("env-file")} {
+				if given {
 					sources++
 				}
 			}
@@ -199,11 +215,31 @@ values until they are deployed again; charlie prints the "charlie deploy
 					return usagef(cmd, "%v", err)
 				}
 			}
-			if sources == 0 && !isTerminal(g.app.Stdin) {
+			switch {
+			case sources == 0 && !isTerminal(g.app.Stdin):
 				return usagef(cmd, "stdin is not a terminal, so charlie cannot ask for the value; pass --stdin to read it from stdin, or --from-file FILE")
+			case fromStdin && isTerminal(g.app.Stdin):
+				return usagef(cmd, "--stdin is for a piped value, but stdin is a terminal, where the value would show as you type; leave out --stdin to be asked without echo, or pipe the value in")
 			}
 			if err := instanceGiven(cmd, instance); err != nil {
 				return err
+			}
+			// What is not typed is read and checked before anything is sent.
+			var (
+				set map[string]string
+				err error
+			)
+			switch {
+			case envFile != "":
+				if set, err = readEnvFile(envFile); err != nil {
+					return err
+				}
+			case sources > 0:
+				v, err := g.readSecretValue(cmd, args[1], fromStdin, fromFile)
+				if err != nil {
+					return err
+				}
+				set = map[string]string{args[1]: v}
 			}
 			c, err := g.client(cmd)
 			if err != nil {
@@ -213,16 +249,12 @@ values until they are deployed again; charlie prints the "charlie deploy
 			if err != nil {
 				return err
 			}
-			var set map[string]string
-			if envFile != "" {
-				set, err = readEnvFile(envFile)
-			} else {
-				var v string
-				v, err = g.readSecretValue(cmd, args[1], fromStdin, fromFile)
+			if set == nil { // asked for once the target is known
+				v, err := g.readSecretValue(cmd, args[1], false, "")
+				if err != nil {
+					return err
+				}
 				set = map[string]string{args[1]: v}
-			}
-			if err != nil {
-				return err
 			}
 			req := apiv1.AppSecretsUpdate{Set: &set}
 			if in != nil {
@@ -232,7 +264,7 @@ values until they are deployed again; charlie prints the "charlie deploy
 			defer cancel()
 			after, err := c.UpdateAppSecrets(ctx, app, req)
 			if err != nil {
-				return secretError(err, app, str(req.Instance), "")
+				return secretError(err, app)
 			}
 			names := slices.Sorted(maps.Keys(set))
 			return g.secretsChanged(a, in, after, names, fmt.Sprintf("Set %s %s.\n", strings.Join(names, ", "), scopeText(app, in)))
@@ -302,7 +334,7 @@ apply the change without a build.`,
 			now, err := c.ListAppSecrets(ctx, app)
 			cancel()
 			if err != nil {
-				return secretError(err, app, inName, "")
+				return secretError(err, app)
 			}
 			set := scopeNames(now, inName)
 			var del []string
@@ -334,7 +366,7 @@ apply the change without a build.`,
 			defer cancel()
 			after, err := c.UpdateAppSecrets(ctx, app, req)
 			if err != nil {
-				return secretError(err, app, inName, "")
+				return secretError(err, app)
 			}
 			return g.secretsChanged(a, in, after, del, fmt.Sprintf("Deleted %s %s.\n", strings.Join(del, ", "), scopeText(app, in)))
 		},
@@ -395,10 +427,21 @@ func checkSecretValue(name string, v []byte) error {
 		return fmt.Errorf("the value of %s is empty", name)
 	case len(v) > maxSecretValue:
 		return fmt.Errorf("the value of %s is longer than %d bytes", name, maxSecretValue)
+	case bytes.IndexByte(v, 0) >= 0:
+		return fmt.Errorf("the value of %s has a NUL byte, which an environment variable cannot hold", name)
 	case !utf8.Valid(v):
 		return fmt.Errorf("the value of %s is not UTF-8 text", name)
 	}
 	return nil
+}
+
+// plainText drops a UTF-8 byte order mark from the start of b. It reports
+// false for UTF-16, which Windows PowerShell 5.1 writes by default.
+func plainText(b []byte) ([]byte, bool) {
+	if bytes.HasPrefix(b, []byte{0xFF, 0xFE}) || bytes.HasPrefix(b, []byte{0xFE, 0xFF}) {
+		return nil, false
+	}
+	return bytes.TrimPrefix(b, []byte{0xEF, 0xBB, 0xBF}), true
 }
 
 // readSecretValue reads the value of name from a file, from one line of
@@ -408,20 +451,30 @@ func (g *globals) readSecretValue(cmd *cobra.Command, name string, fromStdin boo
 		b   []byte
 		err error
 	)
+	// Enough for a byte order mark, the longest value, \r\n and one byte more.
+	const limit = 3 + maxSecretValue + 2 + 1
 	switch {
 	case file != "":
-		b, err = readUpTo(file, maxSecretValue+3)
+		b, err = readUpTo(file, limit)
 		if err != nil {
 			return "", err
+		}
+		var ok bool
+		if b, ok = plainText(b); !ok {
+			return "", fmt.Errorf("%s is UTF-16; save it as UTF-8", file)
 		}
 		b = trimLineBreak(b)
 		if len(b) > maxSecretValue {
 			return "", fmt.Errorf("%s holds more than %d bytes, the most a secret value can have", file, maxSecretValue)
 		}
 	case fromStdin:
-		b, err = io.ReadAll(io.LimitReader(g.app.Stdin, maxSecretValue+3))
+		b, err = io.ReadAll(io.LimitReader(g.app.Stdin, limit))
 		if err != nil {
 			return "", fmt.Errorf("read the value from stdin: %w", err)
+		}
+		var ok bool
+		if b, ok = plainText(b); !ok {
+			return "", errors.New("stdin is UTF-16; send the value as UTF-8")
 		}
 		b = trimLineBreak(b)
 		if slices.Contains(b, '\n') {
@@ -431,10 +484,10 @@ func (g *globals) readSecretValue(cmd *cobra.Command, name string, fromStdin boo
 		fmt.Fprintf(g.app.Stderr, "Value of %s (not shown): ", name)
 		b, err = readHidden(cmd.Context(), g.app.Stdin)
 		fmt.Fprintln(g.app.Stderr)
+		if ctxErr := cmd.Context().Err(); ctxErr != nil { // Ctrl-C, even if a line came after it
+			return "", ctxErr
+		}
 		if err != nil {
-			if cmd.Context().Err() != nil {
-				return "", cmd.Context().Err()
-			}
 			return "", fmt.Errorf("read the value: %w", err)
 		}
 	}
@@ -474,11 +527,18 @@ func readEnvFile(name string) (map[string]string, error) {
 	if len(data) > maxEnvFile {
 		return nil, fmt.Errorf("%s is larger than %d bytes", name, maxEnvFile)
 	}
+	data, ok := plainText(data)
+	if !ok {
+		return nil, fmt.Errorf("%s is UTF-16; save it as UTF-8", name)
+	}
 	return parseEnvFile(name, data)
 }
 
 // parseEnvFile takes NAME=value lines, skipping blank lines and # comments.
-// Errors name the bad lines by number and never print a value.
+// Errors name the bad lines by number and never print a value, nor the
+// text before "=" unless it is a well-formed name: on a line that is not
+// NAME=value, such as "ADMIN_TOKEN: dGhp...==" from YAML or a connection
+// string, that text may hold a secret.
 func parseEnvFile(file string, data []byte) (map[string]string, error) {
 	set := map[string]string{}
 	seen := map[string]int{} // name to line
@@ -494,8 +554,15 @@ func parseEnvFile(file string, data []byte) (map[string]string, error) {
 			bad = append(bad, fmt.Sprintf("line %d: want NAME=value", n))
 			continue
 		}
-		if err := checkSecretName(name); err != nil {
-			bad = append(bad, fmt.Sprintf("line %d: %v", n, err))
+		switch {
+		case !secretNamePattern.MatchString(name):
+			bad = append(bad, fmt.Sprintf(`line %d: not NAME=value: the text before the first "=" does not match ^[A-Z_][A-Z0-9_]*$`, n))
+			continue
+		case len(name) > maxSecretName:
+			bad = append(bad, fmt.Sprintf("line %d: the name is longer than %d characters", n, maxSecretName))
+			continue
+		case appspec.Reserved(name):
+			bad = append(bad, fmt.Sprintf("line %d: %v", n, checkSecretName(name)))
 			continue
 		}
 		if prev, dup := seen[name]; dup {
@@ -521,14 +588,11 @@ func parseEnvFile(file string, data []byte) (map[string]string, error) {
 }
 
 // secretError adds what to do to errors of the secret API.
-func secretError(err error, app, instance, name string) error {
+func secretError(err error, app string) error {
 	switch client.ErrorCode(err) {
 	case "secrets_not_configured":
 		return fmt.Errorf("%w\nApp secrets are off on this server until an administrator gives it a secrets key (PLATFORM_SECRETS_KEY).", err)
 	case "secret_not_found":
-		if instance != "" {
-			return fmt.Errorf("%w\nWithout --instance, get reads the app-wide value; see what instance %s gets with: charlie app secret list %s --instance %s", err, instance, app, instance)
-		}
 		return fmt.Errorf("%w\nSee the secrets with: charlie app secret list %s", err, app)
 	case "instance_not_found":
 		return fmt.Errorf("%w\nSee the instances with: charlie app branch list %s", err, app)

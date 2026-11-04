@@ -199,12 +199,14 @@ charlie app secret rm moimroom HOST_CODE --instance dev   # 덮어쓰기를 지�
 ```
 
 - 시크릿은 앱 단위로 두고, 기본 인스턴스와 추가한 인스턴스가 모두 받습니다. `--instance`를 주면 그 인스턴스의 덮어쓰기를 다룹니다. 인스턴스는 인스턴스 이름(`moimroom`, `moimroom--dev`)이나 브랜치(`main`, `dev`)로 가리키고, 기본 인스턴스의 이름은 앱 이름입니다. 인자가 한 인스턴스의 이름이면서 다른 인스턴스의 브랜치이면 요청을 보내지 않고, 각 인스턴스를 헷갈리지 않게 가리키는 방법을 알려 줍니다.
-- 이름은 `^[A-Z_][A-Z0-9_]*$`, 64자까지이고, 플랫폼이 넣는 `PORT`, `DATABASE_URL`, `S3_*`는 쓸 수 없습니다. 값은 1바이트에서 4096바이트까지의 UTF-8 문자열입니다. 한 번에 넣거나 지우는 이름은 50개까지이고, 앱 단위와 인스턴스마다 50개까지 둘 수 있습니다. charlie가 보내기 전에 같은 규칙으로 검사하고, 서버가 400으로 거부하면 서버의 메시지를 그대로 출력합니다. `platform.yaml`의 env와 이름이 같으면 시크릿이 이깁니다.
+- 이름은 `^[A-Z_][A-Z0-9_]*$`, 64자까지이고, 플랫폼이 넣는 `PORT`, `DATABASE_URL`, `S3_*`는 쓸 수 없습니다. 값은 1바이트에서 4096바이트까지의 UTF-8 문자열이고, 환경 변수에 담을 수 없는 NUL 바이트는 넣을 수 없습니다. 한 번에 넣거나 지우는 이름은 50개까지이고, 앱 단위와 인스턴스마다 50개까지 둘 수 있습니다. charlie가 보내기 전에 같은 규칙으로 검사하고, 서버가 400으로 거부하면 서버의 메시지를 그대로 출력합니다. `platform.yaml`의 env와 이름이 같으면 시크릿이 이깁니다.
 - 값은 명령줄 인자로 받지 않습니다. 셸 히스토리에 남기 때문입니다. `set`은 기본으로 터미널에서 값을 묻고, 입력한 내용을 화면에 보여 주지 않습니다. 터미널이 아니면 다음 중 하나를 줘야 합니다.
-  - `--stdin`: 표준 입력의 한 줄을 읽습니다. 끝의 줄바꿈(`\n`이나 `\r\n`)만 떼고 앞뒤 공백은 그대로 둡니다. 두 줄 이상이면 거부합니다. 예: `printf '%s\n' "$ADMIN_TOKEN" | charlie app secret set moimroom ADMIN_TOKEN --stdin`
+  - `--stdin`: 파이프로 들어온 표준 입력의 한 줄을 읽습니다. 끝의 줄바꿈(`\n`이나 `\r\n`)만 떼고 앞뒤 공백은 그대로 둡니다. 두 줄 이상이면 거부합니다. 표준 입력이 터미널이면 입력이 화면에 보이므로 거부하고, `--stdin` 없이 프롬프트를 쓰라고 알려 줍니다. 예: `printf '%s\n' "$ADMIN_TOKEN" | charlie app secret set moimroom ADMIN_TOKEN --stdin`
   - `--from-file FILE`: 파일 내용을 그대로 쓰고 끝의 줄바꿈 하나만 뗍니다. 인증서처럼 여러 줄인 값에 씁니다. 줄바꿈을 뗀 내용이 4096바이트를 넘으면 거부합니다.
-  - `--env-file FILE`: `NAME=value` 줄마다 시크릿 하나를 넣고, 요청은 PUT 한 번입니다. 빈 줄과 `#`으로 시작하는 줄은 건너뜁니다. 값은 첫 `=` 뒤 전부이고 따옴표를 벗기지 않습니다(`docker run --env-file`과 같다). 줄 끝의 `\r`은 뗍니다. 잘못된 줄이 있으면 아무것도 보내지 않고, 잘못된 줄을 모두 줄 번호와 이유로 출력합니다. 이때 값은 출력하지 않습니다.
-- `get`은 값만 한 줄로 출력하므로 `VALUE=$(charlie app secret get moimroom HOST_CODE)`처럼 쓸 수 있습니다. 표준 출력이 터미널이면 값이 화면에 보인다는 경고 한 줄을 표준 오류에 씁니다. `--instance`를 주면 그 인스턴스의 덮어쓰기만 읽고, 덮어쓰기가 없으면 404 `secret_not_found`와 함께 `--instance` 없이 앱 단위 값을 읽으라고 알려 줍니다. 서버는 값을 읽을 때마다 감사 로그에 이름을 남깁니다.
+  - `--env-file FILE`: `NAME=value` 줄마다 시크릿 하나를 넣고, 요청은 PUT 한 번입니다. 빈 줄과 `#`으로 시작하는 줄은 건너뜁니다. 값은 첫 `=` 뒤 전부이고 따옴표를 벗기지 않습니다(`docker run --env-file`과 같다). 줄 끝의 `\r`은 뗍니다. 파일은 서버에 요청을 보내기 전에 검사합니다. 잘못된 줄이 있으면 아무것도 보내지 않고, 잘못된 줄을 모두 줄 번호와 이유로 출력합니다. 값은 출력하지 않고, 첫 `=` 앞의 글자도 이름 규칙에 맞을 때만 출력합니다. YAML의 `ADMIN_TOKEN: dGhp...==`이나 접속 문자열처럼 `NAME=value`가 아닌 줄에서는 그 앞부분에 비밀이 들어 있을 수 있기 때문입니다.
+  - 세 가지 모두 맨 앞의 UTF-8 BOM은 뗍니다. UTF-16(Windows PowerShell 5.1의 `Out-File`과 `>` 기본값)은 거부하므로 UTF-8로 저장합니다(`Set-Content -Encoding utf8` 등).
+- Git Bash(mintty)에서는 표준 입력이 터미널로 보이지 않아 숨긴 프롬프트를 쓸 수 없습니다. `winpty charlie app secret set ...`로 실행하거나, PowerShell에서 실행하거나, `--stdin`에 파이프로 값을 넘깁니다. `rm`도 같은 이유로 `--yes`가 필요합니다.
+- `get`은 값 뒤에 줄바꿈 하나를 붙여 출력하고 다른 것은 출력하지 않습니다. `VALUE=$(charlie app secret get moimroom HOST_CODE)`처럼 쓸 수 있는데, `$(...)`는 끝의 줄바꿈을 모두 떼므로 값이 줄바꿈으로 끝나면 그 줄바꿈도 사라집니다. 표준 출력이 터미널이면 값이 화면에 보인다는 경고 한 줄을 표준 오류에 씁니다. `--instance`를 주면 그 인스턴스가 받는 값을 출력합니다. 덮어쓰기가 있으면 그 값이고, 없으면 앱 단위 값을 출력하면서 앱 단위 값을 물려받았다는 한 줄을 표준 오류에 씁니다. 둘 다 없을 때만 404 `secret_not_found`로 끝납니다. 서버는 값을 읽을 때마다 감사 로그에 이름을 남깁니다.
 - `list`는 이름과 바꾼 시각, 바꾼 사람만 보여 주고 값은 보여 주지 않습니다. viewer 역할도 쓸 수 있습니다. `--instance`를 주면 그 인스턴스가 받는 시크릿을 SOURCE와 함께 보여 줍니다. `app`은 앱 단위 값, `override`는 앱 단위 값을 덮어쓴 인스턴스 값, `instance-only`는 그 인스턴스에만 있는 값입니다.
 - `rm`은 이름 여러 개를 PUT 한 번으로 지웁니다. 지운 값은 되돌릴 수 없으므로 터미널에서는 `yes`를 입력해야 지우고, 터미널이 아니면 `--yes`가 있어야 합니다. 설정되지 않은 이름은 표준 오류에 알리고 건너뛰며, 지울 것이 하나도 없으면 오류로 끝납니다.
 - 실행 중인 인스턴스는 다시 배포할 때까지 예전 값을 씁니다. `set`과 `rm`은 바뀐 값을 받는 인스턴스마다 재배포 명령을 출력합니다. 앱 단위 시크릿을 바꿀 때 그 이름을 모두 덮어쓴 인스턴스는 빠집니다.
@@ -215,7 +217,7 @@ charlie app secret rm moimroom HOST_CODE --instance dev   # 덮어쓰기를 지�
     charlie deploy moimroom --redeploy
   ```
 
-- `deploy --redeploy`는 빌드와 GitHub 읽기 없이 그 인스턴스의 마지막 healthy 배포를 같은 커밋, 같은 이미지로 다시 배포하고, 이때 지금의 시크릿을 넣습니다. 트리거는 `redeploy`이고 `deploy list`, `deploy show`, `deploy watch`에 그대로 보입니다. `--ref`와 함께 쓰면 사용법 오류(종료 코드 2)입니다. healthy 배포가 없으면 409 `nothing_to_redeploy`, 끝나지 않은 배포가 있으면 409 `deployment_in_progress`로 끝나고, 각각 빌드하는 배포 명령과 `deploy list` 명령을 알려 줍니다.
+- `deploy --redeploy`는 빌드와 GitHub 읽기 없이 그 인스턴스의 마지막 healthy 배포를 같은 커밋, 같은 이미지로 다시 배포하고, 이때 지금의 시크릿을 넣습니다. 트리거는 `redeploy`이고 `deploy list`, `deploy show`, `deploy watch`에 그대로 보입니다. `--ref`와 함께 쓰면 사용법 오류(종료 코드 2)입니다. healthy 배포가 없으면 409 `nothing_to_redeploy`, 끝나지 않은 배포가 있으면 409 `deployment_in_progress`로 끝나고, 각각 빌드하는 배포 명령(준 `--branch`, `--env`를 그대로 붙인다)과 `deploy list` 명령을 알려 줍니다. `--redeploy`를 모르는 예전 서버는 이 플래그를 무시하고 빌드하는 배포를 만들므로, 응답의 트리거가 `redeploy`가 아니면 표준 오류에 경고합니다.
 - 서버에 시크릿 키(`PLATFORM_SECRETS_KEY`)가 없으면 모든 시크릿 명령이 503 `secrets_not_configured`로 끝납니다.
 - `--json`이면 `list`, `set`, `rm`은 API 응답(이름만 있다)을 출력하고, 재배포 안내는 표준 오류로 보냅니다. `list --instance --json`은 `{"instance", "secrets": [{"name", "source", "updatedAt", "updatedBy"}]}`입니다. 출력에 값이 나오는 명령은 `get`뿐입니다.
 
