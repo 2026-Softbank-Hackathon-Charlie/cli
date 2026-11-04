@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -18,11 +19,25 @@ import (
 // instead of launching them.
 func runWithUpdater(t *testing.T, dir string, starts *[]string, args ...string) result {
 	t.Helper()
+	u := testUpdater(t, dir, starts)
+	var out, errb bytes.Buffer
+	app := &App{
+		Version: "v0.0.0-20261102022616-c4fbbe8ccdac", Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errb,
+		Getenv: func(string) string { return "" }, ConfigDir: func() (string, error) { return t.TempDir(), nil },
+		HTTPClient: http.DefaultClient, Updater: &u,
+	}
+	code := app.Run(context.Background(), args)
+	return result{code: code, stdout: out.String(), stderr: errb.String()}
+}
+
+// testUpdater is an updater in dir that records background starts.
+func testUpdater(t *testing.T, dir string, starts *[]string) update.Config {
+	t.Helper()
 	exe := filepath.Join(t.TempDir(), "charlie.exe")
 	if err := os.WriteFile(exe, []byte("bin"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	u := update.Config{
+	return update.Config{
 		Dir:        dir,
 		Version:    "v0.0.0-20261102022616-c4fbbe8ccdac",
 		Getenv:     func(string) string { return "" },
@@ -37,14 +52,38 @@ func runWithUpdater(t *testing.T, dir string, starts *[]string, args ...string) 
 			return nil
 		},
 	}
-	var out, errb bytes.Buffer
-	app := &App{
-		Version: "v0.0.0-20261102022616-c4fbbe8ccdac", Stdin: strings.NewReader(""), Stdout: &out, Stderr: &errb,
-		Getenv: func(string) string { return "" }, ConfigDir: func() (string, error) { return t.TempDir(), nil },
-		HTTPClient: http.DefaultClient, Updater: &u,
+}
+
+// The updater keeps update.json and update.log in the charlie config
+// directory, which CHARLIE_CONFIG_DIR moves.
+func TestUpdaterUsesConfigDir(t *testing.T) {
+	base, moved := t.TempDir(), filepath.Join(t.TempDir(), "state")
+	for _, tc := range []struct {
+		env  map[string]string
+		want string
+	}{
+		{nil, filepath.Join(base, "charlie")},
+		{map[string]string{"CHARLIE_CONFIG_DIR": moved}, moved},
+	} {
+		var starts []string
+		u := testUpdater(t, "", &starts) // New leaves Dir to Run
+		var logPath string
+		u.Start = func(_ string, _ []string, p string) error { logPath = p; return nil }
+		app := &App{
+			Version: "v0.0.0-20261102022616-c4fbbe8ccdac", Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard,
+			Getenv: func(k string) string { return tc.env[k] }, ConfigDir: func() (string, error) { return base, nil },
+			HTTPClient: http.DefaultClient, Updater: &u,
+		}
+		if code := app.Run(context.Background(), []string{"version"}); code != 0 {
+			t.Fatalf("exit %d", code)
+		}
+		if logPath != filepath.Join(tc.want, "update.log") {
+			t.Errorf("env %v: log %s, want it in %s", tc.env, logPath, tc.want)
+		}
+		if _, err := os.Stat(filepath.Join(tc.want, "update.json")); err != nil {
+			t.Errorf("env %v: %v", tc.env, err)
+		}
 	}
-	code := app.Run(context.Background(), args)
-	return result{code: code, stdout: out.String(), stderr: errb.String()}
 }
 
 func TestCommandStartsBackgroundUpdateAfterwards(t *testing.T) {

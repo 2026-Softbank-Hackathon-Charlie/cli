@@ -25,21 +25,56 @@ go build -o bin/charlie -ldflags "-X main.version=v0.1.0" ./cmd/charlie
 - 새 버전이 있으면 `go install`로 빌드해서 실행 파일을 바꿉니다. 바뀌면 다음 명령을 실행할 때 한 줄로 알려 줍니다.
 - 지금 바로 확인하려면 `charlie update`를 실행합니다.
 - `CHARLIE_UPDATE_INTERVAL`로 확인 주기를 바꿉니다(예: `1h`, `0`이면 매번). `CHARLIE_NO_UPDATE=1`이면 자동 확인을 끕니다.
-- 백그라운드 기록은 `%AppData%\charlie\update.log`(Windows) 또는 `~/.config/charlie/update.log`에 남습니다.
+- 백그라운드 기록은 설정 디렉터리(아래 "설정 디렉터리와 환경 변수")의 `update.log`에 남습니다. 기본은 `%AppData%\charlie\update.log`(Windows) 또는 `~/.config/charlie/update.log`입니다.
 - `go` 명령이 없거나 `go build`로 직접 만든 개발 빌드는 업데이트하지 않습니다.
 
 ## 로그인
 
 ```bash
-charlie login --server https://<플랫폼 API 주소>   # 토큰을 묻는다. 입력은 화면에 보이지 않는다
+charlie login     # 코드를 보여 주고, 관리자가 콘솔에서 승인하면 토큰을 저장한다
 charlie whoami
 charlie logout
 ```
 
-- 로그인 정보는 `%AppData%\charlie\config.json`(Windows) 또는 `~/.config/charlie/config.json`에 저장됩니다. Linux와 macOS에서는 권한이 0600입니다.
+`charlie login`은 device code 방식(RFC 8628을 따른다)으로 로그인합니다.
+
+1. charlie가 서버에서 코드를 받아 `BCDF-GHJK` 같은 8글자 코드와 콘솔 주소(`https://console.hopcharlie.dev/#device`)를 보여 줍니다. 코드는 10분 동안 유효합니다.
+2. 웹 콘솔에 관리자 아이디와 비밀번호로 로그인한 사람이 그 페이지에 코드를 입력하고, 이 CLI가 받을 역할(operator, agent, viewer)을 골라 승인합니다.
+3. charlie는 서버가 정한 간격(5초)으로 승인 여부를 묻다가, 승인되면 30일 동안 유효한 토큰을 받아 저장합니다. 관리자가 거절하거나 코드가 만료되면 오류로 끝납니다.
+
+- 서버는 `--server`, `CHARLIE_SERVER`, 저장된 로그인 순서로 정하고, 아무것도 없으면 팀 배포인 `https://api.hopcharlie.dev`를 씁니다.
+- 토큰에는 승인한 관리자의 이름과 그 관리자가 고른 역할이 들어갑니다. 역할에 따라 쓸 수 있는 명령이 다릅니다. viewer는 읽기만 하고, agent는 Plan 제출까지 하며, 승인이나 실행은 operator만 할 수 있습니다.
+- 같은 서버에 저장된 토큰이 있는데 다시 로그인하면(다른 역할을 받으려는 경우 등) 새 토큰을 저장한 뒤 예전 토큰을 서버에서 끝냅니다. 끝내지 못하면 그 토큰이 언제까지 유효한지 알려 줍니다.
+- 기다리는 동안 Ctrl-C로 멈춰도 코드는 남아 있어서, charlie가 알려 주는 명령을 다시 실행하면 같은 코드로 이어서 기다립니다. 그 서버가 그냥 `charlie login`이 고르는 서버(저장된 로그인의 서버, 없으면 기본 서버)와 다르면 `charlie login --server <주소>`로 알려 줍니다. 다른 서버로 로그인하면 남은 코드는 버리고 새 코드를 받습니다.
+- 기다리는 동안 네트워크 오류나 서버 오류(5xx)가 나면 같은 간격으로 계속 다시 묻습니다.
+- `charlie whoami`는 토큰의 이름과 역할, 저장된 로그인이 만료되는 시각을 보여 줍니다. 저장된 로그인이 만료되거나 취소되어 서버가 401로 답하면 `charlie login`을 다시 하라고 알려 줍니다.
+- `charlie logout`은 먼저 서버에 토큰을 끝내 달라고 요청하고, 그다음 저장된 로그인과 남은 코드를 지웁니다. 서버에 닿지 못하면 파일만 지우고, 그 토큰은 만료 시각까지 서버에서 유효하다고 알려 줍니다. 예전 버전이 저장한 정적 토큰(만료 시각이 없다)은 서버가 끝낼 수 없으므로 파일만 지우고 그렇게 알려 줍니다.
+- 저장된 로그인 파일이 깨져 있어도 `charlie login`은 경고를 출력하고 새로 로그인해서 파일을 바꿉니다.
+
+### 봇과 원격 호스트에서 로그인하기
+
+Slack 봇 Rin처럼 실행이 끝나면 프로세스가 사라지는 곳이나 원격 호스트에서는 `--no-wait`로 두 단계에 나눠 로그인합니다.
+
+```bash
+charlie login --no-wait   # 코드를 출력하고 승인을 기다리지 않고 끝난다
+# 관리자가 콘솔에서 승인한 뒤
+charlie login             # 남은 코드로 승인 여부를 확인하고 토큰을 저장한다
+```
+
+- 두 번째 `charlie login`은 다른 프로세스여도 됩니다. 같은 설정 디렉터리를 보면 됩니다(아래 `CHARLIE_CONFIG_DIR`).
+- 남은 코드가 있으면 charlie는 새 코드를 받기 전에 서버에 한 번 물어봅니다. 로컬 시계로 만료 시각이 지났어도 묻는데, 관리자가 승인하면 서버가 토큰을 받아 갈 시간을 10분 늘려 주기 때문입니다. 서버가 만료라고 답하면 새 코드를 받아 보여 주고(`--no-wait`도 같다), 거절이라고 답하면 오류로 끝납니다.
+- 그래서 이미 승인된 코드가 남아 있으면 `charlie login --no-wait`도 토큰을 저장하고 끝납니다.
+- 서버는 승인된 코드의 토큰을 한 번만 내줍니다. 같은 설정 디렉터리의 다른 `charlie login`이 먼저 받아 갔으면, 나머지는 새 코드를 받지 않고 그 로그인을 알려 준 뒤 성공으로 끝납니다.
+- 남은 코드를 확인할 때 서버가 아닌 곳의 응답(프록시의 403 페이지 같은 것)이 오면 남은 코드를 버리고 새 코드를 받습니다.
+- `--json`을 붙이면 `--no-wait`는 객체 하나만 출력합니다. 보통은 `{"userCode", "verificationUri", "expiresAt", "server"}`이고, 남은 코드가 이미 승인되어 토큰을 저장했으면 `{"name", "role", "expiresAt"}`입니다. 기다리는 모드는 안내를 표준 오류로 내보내고, 로그인이 끝나면 `{"name", "role", "expiresAt"}`을 출력합니다. 어느 쪽도 device code와 토큰은 출력하지 않습니다.
+
+### 설정 디렉터리와 환경 변수
+
+- 저장된 로그인(`config.json`), 승인을 기다리는 코드(`pending-login.json`), 자동 업데이트 파일(`update.json`, `update.log`)은 `%AppData%\charlie`(Windows), `~/.config/charlie`(Linux), `~/Library/Application Support/charlie`(macOS)에 둡니다. Linux와 macOS에서는 로그인 파일의 권한이 0600, 디렉터리 권한이 0700입니다.
+- `CHARLIE_CONFIG_DIR`을 주면 이 파일을 모두 그 디렉터리에 둡니다. 실행마다 컨테이너가 새로 뜨는 봇은 영구 볼륨의 디렉터리를 가리키게 합니다. 이미 있는 디렉터리는 공유 볼륨일 수 있으므로 권한을 바꾸지 않고, 로그인 파일만 0600으로 씁니다. 없는 디렉터리는 0700으로 만듭니다.
 - `CHARLIE_SERVER`, `CHARLIE_TOKEN` 환경 변수가 저장된 값보다 우선하고, `--server` 플래그가 그보다 우선합니다.
+- 로그인할 수 없는 프로그램과 CI는 서버의 `PLATFORM_TOKENS`에 등록된 정적 토큰을 `CHARLIE_TOKEN`으로 줍니다. 정적 토큰은 만료되지 않고 `logout`으로 끝낼 수도 없습니다.
 - 저장된 토큰은 로그인한 서버에만 보냅니다. 다른 서버를 지정하면 `CHARLIE_TOKEN`을 주거나 그 서버로 다시 로그인해야 합니다.
-- 토큰의 역할(viewer, agent, operator)에 따라 쓸 수 있는 명령이 다릅니다. agent 토큰으로는 승인이나 실행을 할 수 없습니다.
 
 ## 명령
 

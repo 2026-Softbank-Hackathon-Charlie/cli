@@ -7,102 +7,12 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/2026-Softbank-Hackathon-Charlie/platform/pkg/apiv1"
 )
-
-func TestLoginSavesConfigAndNeverPrintsToken(t *testing.T) {
-	const token = "s3cret-token-value"
-	f := newFake(t, token)
-	h := newHarness(t, nil)
-
-	r := h.run(token+"\n", "login", "--server", f.URL+"/").ok(t)
-	if !strings.Contains(r.stdout, "Logged in to "+f.URL+" as alice (operator)") {
-		t.Errorf("stdout = %q", r.stdout)
-	}
-	if strings.Contains(r.stdout+r.stderr, token) {
-		t.Fatalf("token printed:\n%s%s", r.stdout, r.stderr)
-	}
-	if got := f.last(t, "GET", "/v1/me").header.Get("Authorization"); got != "Bearer "+token {
-		t.Errorf("login checked with %q", got)
-	}
-
-	path := filepath.Join(h.dir, "charlie", "config.json")
-	b, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var cfg config
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		t.Fatal(err)
-	}
-	if cfg != (config{Server: f.URL, Token: token}) {
-		t.Errorf("config = %+v", cfg)
-	}
-	// Windows has no Unix permission bits; os.Stat reports 0666 there.
-	if runtime.GOOS != "windows" {
-		if fi, _ := os.Stat(path); fi.Mode().Perm() != 0o600 {
-			t.Errorf("config mode = %v, want 0600", fi.Mode().Perm())
-		}
-		if fi, _ := os.Stat(filepath.Dir(path)); fi.Mode().Perm() != 0o700 {
-			t.Errorf("config dir mode = %v, want 0700", fi.Mode().Perm())
-		}
-	}
-	matches, _ := filepath.Glob(filepath.Join(h.dir, "charlie", "config-*"))
-	if len(matches) != 0 {
-		t.Errorf("temporary files left: %v", matches)
-	}
-
-	r = h.run("", "whoami").ok(t)
-	if !strings.Contains(r.stdout, "alice (operator) on "+f.URL) {
-		t.Errorf("whoami = %q", r.stdout)
-	}
-	r = h.run("", "--json", "whoami").ok(t)
-	var me apiv1.Principal
-	if err := json.Unmarshal([]byte(r.stdout), &me); err != nil || me.Name != "alice" {
-		t.Errorf("whoami --json = %q (%v)", r.stdout, err)
-	}
-
-	r = h.run("", "logout").ok(t)
-	if !strings.Contains(r.stdout, "Logged out") {
-		t.Errorf("logout = %q", r.stdout)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Errorf("config still exists: %v", err)
-	}
-	if r = h.run("", "logout").ok(t); !strings.Contains(r.stdout, "Not logged in") {
-		t.Errorf("second logout = %q", r.stdout)
-	}
-	if r = h.run("", "whoami"); r.code != ExitError || !strings.Contains(r.stderr, "no server configured") {
-		t.Errorf("whoami after logout: exit %d, %q", r.code, r.stderr)
-	}
-}
-
-func TestLoginFailures(t *testing.T) {
-	f := newFake(t, "right")
-	h := newHarness(t, nil)
-
-	r := h.run("wrong-token\n", "login", "--server", f.URL)
-	if r.code != ExitError || !strings.Contains(r.stderr, "unauthorized") {
-		t.Errorf("bad token: exit %d, %q", r.code, r.stderr)
-	}
-	if strings.Contains(r.stdout+r.stderr, "wrong-token") {
-		t.Errorf("token printed: %s", r.stderr)
-	}
-	if _, err := os.Stat(filepath.Join(h.dir, "charlie", "config.json")); !os.IsNotExist(err) {
-		t.Errorf("config written after a failed login")
-	}
-	if r := h.run("", "login", "--server", f.URL); r.code != ExitError || !strings.Contains(r.stderr, "no token") {
-		t.Errorf("empty stdin: exit %d, %q", r.code, r.stderr)
-	}
-	if r := h.run("tok\n", "login"); r.code != ExitUsage {
-		t.Errorf("no server: exit %d, %q", r.code, r.stderr)
-	}
-}
 
 func TestSettingsPrecedence(t *testing.T) {
 	a, b, c := newFake(t, ""), newFake(t, ""), newFake(t, "")
@@ -133,7 +43,7 @@ func TestSettingsPrecedence(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, tc.env)
 			saved := cmp.Or(tc.saved, a.URL)
-			if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: saved, Token: "file-token"}); err != nil {
+			if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: saved, Token: "file-token"}, true); err != nil {
 				t.Fatal(err)
 			}
 			before := map[*fakeServer]int{a: len(a.requests()), b: len(b.requests()), c: len(c.requests())}
@@ -162,12 +72,13 @@ func TestSettingsPrecedence(t *testing.T) {
 
 	// Logging in to the other server still works, and replaces the saved login.
 	h := newHarness(t, nil)
-	if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: a.URL, Token: "file-token"}); err != nil {
+	if err := saveConfig(filepath.Join(h.dir, "charlie", "config.json"), config{Server: a.URL, Token: "file-token"}, true); err != nil {
 		t.Fatal(err)
 	}
-	h.run("c-token\n", "login", "--server", c.URL).ok(t)
+	c.devicePoll = pollScript("approved")
+	h.run("", "login", "--server", c.URL).ok(t)
 	h.run("", "whoami").ok(t)
-	if got := c.last(t, "GET", "/v1/me").header.Get("Authorization"); got != "Bearer c-token" {
+	if got := c.last(t, "GET", "/v1/me").header.Get("Authorization"); got != "Bearer "+fakeCLIToken(fakeDeviceCode(0)) {
 		t.Errorf("after login to c, Authorization = %q", got)
 	}
 }
@@ -297,6 +208,9 @@ func TestAPIErrorsAreShown(t *testing.T) {
 	h.env["CHARLIE_TOKEN"] = "wrong"
 	if r = h.run("", "plan", "list"); r.code != ExitError || !strings.Contains(r.stderr, "unauthorized: missing or invalid bearer token") {
 		t.Errorf("exit %d, stderr %q", r.code, r.stderr)
+	}
+	if strings.Contains(r.stderr, "saved login") {
+		t.Errorf("CHARLIE_TOKEN got the saved login hint: %q", r.stderr)
 	}
 }
 
