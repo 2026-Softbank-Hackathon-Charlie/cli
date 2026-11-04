@@ -36,6 +36,13 @@ type deployFake struct {
 	events func(w http.ResponseWriter, r *http.Request, conn int)
 	conns  int
 	added  []apiv1.AppInstance // instances of moimroom added since the fixture
+
+	// redeployCode, when set, is the 409 error code of every redeploy, or
+	// "ignore" to queue a build as a server without redeploy would.
+	redeployCode string
+	// App secrets of moimroom, by instance ("" app-wide) and name; nil
+	// answers 503 secrets_not_configured. See secretRoutes.
+	secrets map[string]map[string]fakeSecret
 }
 
 // registeredApp is moimroom as the server lists it now: the fixture and the
@@ -50,7 +57,7 @@ func (f *deployFake) registeredApp() apiv1.App {
 
 func newDeployFake(t *testing.T) *deployFake {
 	t.Helper()
-	f := &deployFake{}
+	f := &deployFake{secrets: fixtureSecrets()}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/apps", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, apiv1.AppList{Apps: []apiv1.App{fixtureFileApp(), f.registeredApp()}})
@@ -162,6 +169,22 @@ func newDeployFake(t *testing.T) *deployFake {
 			return
 		}
 		d.Trigger = apiv1.DeploymentTriggerManual
+		if req.Redeploy != nil && *req.Redeploy {
+			f.mu.Lock()
+			code := f.redeployCode
+			f.mu.Unlock()
+			switch code {
+			case "nothing_to_redeploy":
+				writeError(w, 409, code, "instance "+d.Instance+" has no healthy deployment to deploy again")
+				return
+			case "deployment_in_progress":
+				writeError(w, 409, code, "instance "+d.Instance+" has a deployment that has not finished")
+				return
+			}
+			if code != "ignore" { // "ignore": a server from before redeploy
+				d.Trigger = apiv1.DeploymentTriggerRedeploy
+			}
+		}
 		if req.Ref != nil {
 			d.Ref = *req.Ref
 		}
@@ -211,6 +234,7 @@ func newDeployFake(t *testing.T) *deployFake {
 		w.Header().Set("Content-Type", "text/event-stream")
 		script(w, r, n)
 	})
+	f.secretRoutes(mux)
 	mux.HandleFunc("GET /v1/github/repos", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, apiv1.GitHubRepoList{Repos: []apiv1.GitHubRepo{
 			{FullName: "org/moimroom", Private: true, DefaultBranch: "main", HtmlUrl: "https://github.com/org/moimroom"},

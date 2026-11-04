@@ -25,7 +25,7 @@ const appShowDeployments = 5
 
 func (g *globals) appCmd() *cobra.Command {
 	return group("app", "Register apps from GitHub, see how they run and check platform.yaml",
-		g.appAddCmd(), g.appListCmd(), g.appShowCmd(), g.appRmCmd(), g.appBranchCmd(), g.appValidateCmd(), g.appReposCmd())
+		g.appAddCmd(), g.appListCmd(), g.appShowCmd(), g.appRmCmd(), g.appBranchCmd(), g.appSecretCmd(), g.appValidateCmd(), g.appReposCmd())
 }
 
 func (g *globals) appAddCmd() *cobra.Command {
@@ -125,7 +125,11 @@ func onOff(b bool) string {
 // queuedLine names the instance the deployment goes to; servers from before
 // branch instances only name the app.
 func queuedLine(d *apiv1.Deployment) string {
-	return fmt.Sprintf("Queued deployment %s of %s at %s (%s) to %s.\n", d.Id, cmp.Or(d.Instance, d.App), d.Ref, shortSHA(d.Commit), envNames(d.Environments))
+	what := "deployment"
+	if d.Trigger == apiv1.DeploymentTriggerRedeploy {
+		what = "redeploy"
+	}
+	return fmt.Sprintf("Queued %s %s of %s at %s (%s) to %s.\n", what, d.Id, cmp.Or(d.Instance, d.App), d.Ref, shortSHA(d.Commit), envNames(d.Environments))
 }
 
 func (g *globals) appListCmd() *cobra.Command {
@@ -564,9 +568,9 @@ func renderRepos(l *apiv1.GitHubRepoList) string {
 
 func (g *globals) deployCmd() *cobra.Command {
 	var (
-		branch, ref string
-		envs        []string
-		watch       bool
+		branch, ref     string
+		envs            []string
+		watch, redeploy bool
 	)
 	cmd := &cobra.Command{
 		Use:   "deploy APP",
@@ -577,6 +581,13 @@ default) or a branch added with "charlie app branch add". --ref is the branch,
 tag or commit sha to deploy into that instance; by default the head of the
 branch. The platform builds one image per service, commits
 apps/<instance>/<env>.yaml to the gitops repository and Argo CD syncs it.
+
+--redeploy builds nothing: it deploys the instance's last healthy deployment
+again, the same commit and images, with the app's secrets as they are now.
+Use it after "charlie app secret set" or "rm". It cannot be combined with
+--ref, and it fails when the instance has no healthy deployment yet or a
+deployment of it is still going.
+
 With --watch, follows the deployment and exits 0 when it is healthy and 3 when
 it failed or a newer deployment of the instance superseded it.`,
 		Args: exactArgs("APP"),
@@ -584,6 +595,12 @@ it failed or a newer deployment of the instance superseded it.`,
 			var req apiv1.DeploymentCreateRequest
 			if cmd.Flags().Changed("branch") { // the server refuses an empty one
 				req.Branch = &branch
+			}
+			if redeploy {
+				if cmd.Flags().Changed("ref") {
+					return usagef(cmd, "--ref cannot be used with --redeploy, which deploys the commit of the instance's last healthy deployment")
+				}
+				req.Redeploy = &redeploy
 			}
 			if ref != "" {
 				req.Ref = &ref
@@ -601,8 +618,14 @@ it failed or a newer deployment of the instance superseded it.`,
 			ctx, cancel := callCtx(cmd)
 			defer cancel()
 			d, err := c.CreateDeployment(ctx, args[0], req)
+			if err != nil && redeploy {
+				return redeployError(err, args[0], req.Branch, envs)
+			}
 			if err != nil {
 				return err
+			}
+			if redeploy && d.Trigger != apiv1.DeploymentTriggerRedeploy {
+				fmt.Fprintf(g.app.Stderr, "warning: the server queued a %s deployment, not a redeploy; it does not know --redeploy, so this deployment builds the head of the branch\n", d.Trigger)
 			}
 			p := g.out()
 			switch {
@@ -628,8 +651,29 @@ it failed or a newer deployment of the instance superseded it.`,
 	f.StringVar(&ref, "ref", "", "branch, tag or commit sha to deploy into that instance (default: the head of the branch)")
 	f.StringSliceVar(&envs, "env", nil, "deploy only to these of the app's environments; repeat it or separate with commas")
 	f.BoolVar(&watch, "watch", false, "watch the deployment after starting it")
+	f.BoolVar(&redeploy, "redeploy", false, "deploy the instance's last healthy deployment again without a build, with the current secrets")
 	cmd.AddCommand(g.deployListCmd(), g.deployShowCmd(), g.deployWatchCmd(), g.deployLogsCmd())
 	return cmd
+}
+
+// redeployError says what to do when a redeploy is refused. branch and envs
+// are the --branch and --env given, if any.
+func redeployError(err error, app string, branch *string, envs []string) error {
+	flag := ""
+	if branch != nil {
+		flag = " --branch " + *branch
+	}
+	envFlag := ""
+	if len(envs) > 0 {
+		envFlag = " --env " + strings.Join(envs, ",")
+	}
+	switch client.ErrorCode(err) {
+	case "nothing_to_redeploy":
+		return fmt.Errorf("%w\nA redeploy repeats the instance's last healthy deployment, and it has none; deploy it with a build: charlie deploy %s%s%s", err, app, flag, envFlag)
+	case "deployment_in_progress":
+		return fmt.Errorf("%w\nWait until that deployment ends, then redeploy; see it with: charlie deploy list %s%s", err, app, flag)
+	}
+	return err
 }
 
 // noteRefInstance warns on stderr when ref is the branch of an added

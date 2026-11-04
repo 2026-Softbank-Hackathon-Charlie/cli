@@ -183,18 +183,29 @@ func notRegistered(app string) error {
 // and is the branch of another, and the default instance, which goes only
 // with the app.
 func resolveInstance(app string, ins []apiv1.AppInstance, arg string) (*apiv1.AppInstance, error) {
+	in, err := findInstance(app, ins, arg, true)
+	if err != nil {
+		return nil, err
+	}
+	if in.Default {
+		return nil, fmt.Errorf(`instance %s deploys the app's own branch %s; the default instance goes only with the app; use "charlie app rm %s"`, in.Name, in.Branch, app)
+	}
+	return in, nil
+}
+
+// findInstance finds the instance of app that arg names, by its instance
+// name or by its branch; the default instance is named after the app. It
+// refuses an arg that names one instance and is the branch of another; rm
+// words that for "charlie app branch rm", otherwise for --instance.
+func findInstance(app string, ins []apiv1.AppInstance, arg string, rm bool) (*apiv1.AppInstance, error) {
 	byName, byBranch := instanceMatches(ins, arg)
 	switch {
 	case byName == nil && byBranch == nil:
 		return nil, fmt.Errorf("app %s has no instance or branch %q; list them with: charlie app branch list %s", app, arg, app)
 	case byName != nil && byBranch != nil && byName != byBranch:
-		return nil, ambiguousInstance(app, ins, arg, byName, byBranch)
+		return nil, ambiguousInstance(app, ins, arg, byName, byBranch, rm)
 	}
-	in := cmp.Or(byName, byBranch)
-	if in.Default {
-		return nil, fmt.Errorf(`instance %s deploys the app's own branch %s; the default instance goes only with the app; use "charlie app rm %s"`, in.Name, in.Branch, app)
-	}
-	return in, nil
+	return cmp.Or(byName, byBranch), nil
 }
 
 // instanceMatches returns the instance named arg and the instance that
@@ -214,20 +225,32 @@ func instanceMatches(ins []apiv1.AppInstance, arg string) (byName, byBranch *api
 // ambiguousInstance says that arg names one instance and is the branch of
 // another, and how to name each added one on its own: the instance named arg
 // by its branch, the other by its instance name. When that is ambiguous too,
-// only the console or the API can pick it.
-func ambiguousInstance(app string, ins []apiv1.AppInstance, arg string, byName, byBranch *apiv1.AppInstance) error {
+// only the console or the API can pick it. rm says it for "charlie app
+// branch rm", which cannot remove the default instance anyway; otherwise
+// for --instance.
+func ambiguousInstance(app string, ins []apiv1.AppInstance, arg string, byName, byBranch *apiv1.AppInstance, rm bool) error {
 	named := "instance " + byName.Name
 	if byName.Default {
 		named = "the default instance " + byName.Name
 	}
-	msg := fmt.Sprintf("%q is %s (branch %s) and the branch of instance %s; nothing was deleted", arg, named, byName.Branch, byBranch.Name)
-	way := func(in *apiv1.AppInstance, by, what string) string {
-		if n, b := instanceMatches(ins, by); n == nil || b == nil || n == b {
-			return fmt.Sprintf("; to remove %s, name it by its %s: charlie app branch rm %s %s", in.Name, what, app, by)
-		}
-		return fmt.Sprintf("; to remove %s, use the console or the API (DELETE /v1/apps/%s/instances/%s)", in.Name, app, in.Name)
+	msg := fmt.Sprintf("%q is %s (branch %s) and the branch of instance %s", arg, named, byName.Branch, byBranch.Name)
+	if rm {
+		msg += "; nothing was deleted"
 	}
-	if !byName.Default {
+	way := func(in *apiv1.AppInstance, by, what string) string {
+		n, b := instanceMatches(ins, by)
+		alone := n == nil || b == nil || n == b
+		switch {
+		case rm && alone:
+			return fmt.Sprintf("; to remove %s, name it by its %s: charlie app branch rm %s %s", in.Name, what, app, by)
+		case rm:
+			return fmt.Sprintf("; to remove %s, use the console or the API (DELETE /v1/apps/%s/instances/%s)", in.Name, app, in.Name)
+		case alone:
+			return fmt.Sprintf("; for %s, name it by its %s: --instance %s", in.Name, what, by)
+		}
+		return fmt.Sprintf("; for %s, use the console or the API with instance %s", in.Name, in.Name)
+	}
+	if !rm || !byName.Default {
 		msg += way(byName, byName.Branch, "branch")
 	}
 	return errors.New(msg + way(byBranch, byBranch.Name, "instance name"))
