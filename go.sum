@@ -1,3 +1,5 @@
+github.com/2026-Softbank-Hackathon-Charlie/platform v0.0.0-20261104020841-69ad1c612bd3 h1:rPz7eM1i5THZGHMcNwY1b3Yxxzk4+ursrlNKsJl37qM=
+github.com/2026-Softbank-Hackathon-Charlie/platform v0.0.0-20261104020841-69ad1c612bd3/go.mod h1:IzZlGY6ogVd0qmcaM9/BkcVyt18pS7lgyrOu0Rhjlu4=
 github.com/cpuguy83/go-md2man/v2 v2.0.6/go.mod h1:oOW0eioCTA6cOiMLiUPZOpcVxMig6NIQQ7OS05n1F4g=
 github.com/getkin/kin-openapi v0.142.0 h1:izj0vBdFprMhitfzaX8sTqztsEQyvwhssBoB6n8NO7w=
 github.com/getkin/kin-openapi v0.142.0/go.mod h1:3BH9M9XDe/y9M5DSvEocVYAYq1w0qrhJHjC/vZi0AaY=
