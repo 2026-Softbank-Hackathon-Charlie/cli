@@ -16,3 +16,5 @@ require (
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/2026-Softbank-Hackathon-Charlie/platform => ../platform-auth
