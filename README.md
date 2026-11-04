@@ -142,7 +142,12 @@ charlie migrate switch <run id>
 | `app branch add APP BRANCH [--no-auto-deploy] [--watch]` | 앱 레포의 다른 브랜치를 인스턴스 하나로 더 띄우고 첫 배포를 큐에 넣는다 (operator). 인스턴스 이름과 URL을 출력한다. `--no-auto-deploy`가 없으면 그 브랜치에 push 할 때마다 그 인스턴스에 다시 배포한다 |
 | `app branch list APP` | 앱의 인스턴스 목록: 인스턴스 이름, 브랜치, 기본 인스턴스인지, 자동 배포, 환경별 상태, 커밋, URL |
 | `app branch rm APP INSTANCE\|BRANCH [--yes]` | 추가한 인스턴스를 지운다 (operator). 인스턴스 이름이나 브랜치로 가리킨다. Argo CD가 그 인스턴스의 네임스페이스와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 인스턴스 이름을 입력해야 지운다. 기본 인스턴스는 `app rm`으로 앱과 함께만 지운다 |
-| `deploy APP [--branch B] [--ref REF] [--env ENV...] [--watch]` | 지금 배포한다 (operator). `--branch`는 어느 인스턴스에 배포할지 브랜치로 고르고, 기본은 앱의 기본 브랜치다. `--ref`는 그 인스턴스에 배포할 브랜치, 태그나 커밋이고, 기본은 그 브랜치의 head다. `--env`가 없으면 앱의 모든 환경 |
+| `app secret list APP [--instance INSTANCE\|BRANCH]` | 시크릿 이름과 바꾼 시각, 바꾼 사람. 값은 보여 주지 않는다. `--instance`면 그 인스턴스가 받는 시크릿과 출처(SOURCE). 아래 "시크릿" |
+| `app secret get APP NAME [--instance INSTANCE\|BRANCH]` | 시크릿 값 하나만 출력한다 (operator) |
+| `app secret set APP NAME [--instance INSTANCE\|BRANCH] [--stdin \| --from-file FILE]` | 시크릿 하나를 넣거나 바꾼다 (operator). 값은 기본으로 화면에 보이지 않는 프롬프트로 받는다 |
+| `app secret set APP --env-file FILE [--instance INSTANCE\|BRANCH]` | 파일의 `NAME=value` 줄을 한 번에 넣는다 (operator) |
+| `app secret rm APP NAME... [--instance INSTANCE\|BRANCH] [--yes]` | 시크릿을 지운다 (operator). `--yes`가 없으면 터미널에서 `yes`를 입력해야 지운다 |
+| `deploy APP [--branch B] [--ref REF \| --redeploy] [--env ENV...] [--watch]` | 지금 배포한다 (operator). `--branch`는 어느 인스턴스에 배포할지 브랜치로 고르고, 기본은 앱의 기본 브랜치다. `--ref`는 그 인스턴스에 배포할 브랜치, 태그나 커밋이고, 기본은 그 브랜치의 head다. `--redeploy`는 빌드 없이 그 인스턴스의 마지막 healthy 배포를 지금의 시크릿으로 다시 배포한다. `--env`가 없으면 앱의 모든 환경 |
 | `deploy list APP [--branch B] [--limit N]` | 배포 목록 (최신순, 기본 20개). 모든 인스턴스의 배포를 브랜치와 함께 보여 주고, `--branch`면 그 브랜치의 인스턴스 배포만 |
 | `deploy show ID` | 배포 상세: 상태, 브랜치와 인스턴스, 커밋, 트리거, 환경별 상태, 빌드한 이미지 |
 | `deploy watch ID` | 단계, 환경별 상태, 빌드와 배포 로그, 경과 시간을 실시간으로 표시하고, 끝나면 배포한 인스턴스의 URL을 보여 준다 |
@@ -176,6 +181,43 @@ charlie app branch add moimroom dev --watch            # dev 브랜치를 moimro
 charlie deploy moimroom --branch dev --ref 9fceb02     # moimroom--dev에 특정 커밋을 배포
 charlie app branch rm moimroom dev
 ```
+
+### 시크릿
+
+`HOST_CODE`, `ADMIN_TOKEN`처럼 레포에 둘 수 없는 환경 변수는 플랫폼에 시크릿으로 넣습니다(platform 레포 `docs/adr/0019-app-secrets-and-redeploy.md`). 플랫폼은 값을 암호화해 보관하고, 배포할 때 Sealed Secrets로 봉인해 모든 서비스 컨테이너에 환경 변수로 넣습니다.
+
+```bash
+charlie app secret set moimroom HOST_CODE                 # 값을 묻는다. 입력은 화면에 보이지 않는다
+charlie app secret set moimroom HOST_CODE --instance dev  # moimroom--dev만 다른 값으로 덮어쓴다
+charlie app secret set moimroom --env-file secrets.env    # NAME=value 줄을 한 번에 넣는다
+charlie app secret list moimroom
+charlie app secret list moimroom --instance dev           # moimroom--dev가 받는 시크릿과 출처
+charlie app secret get moimroom HOST_CODE                 # 값만 출력한다
+charlie deploy moimroom --redeploy                        # 빌드 없이 바뀐 시크릿을 반영한다
+charlie deploy moimroom --redeploy --branch dev
+charlie app secret rm moimroom HOST_CODE --instance dev   # 덮어쓰기를 지우면 앱 단위 값으로 돌아간다
+```
+
+- 시크릿은 앱 단위로 두고, 기본 인스턴스와 추가한 인스턴스가 모두 받습니다. `--instance`를 주면 그 인스턴스의 덮어쓰기를 다룹니다. 인스턴스는 인스턴스 이름(`moimroom`, `moimroom--dev`)이나 브랜치(`main`, `dev`)로 가리키고, 기본 인스턴스의 이름은 앱 이름입니다. 인자가 한 인스턴스의 이름이면서 다른 인스턴스의 브랜치이면 요청을 보내지 않고, 각 인스턴스를 헷갈리지 않게 가리키는 방법을 알려 줍니다.
+- 이름은 `^[A-Z_][A-Z0-9_]*$`, 64자까지이고, 플랫폼이 넣는 `PORT`, `DATABASE_URL`, `S3_*`는 쓸 수 없습니다. 값은 1바이트에서 4096바이트까지의 UTF-8 문자열입니다. 한 번에 넣거나 지우는 이름은 50개까지이고, 앱 단위와 인스턴스마다 50개까지 둘 수 있습니다. charlie가 보내기 전에 같은 규칙으로 검사하고, 서버가 400으로 거부하면 서버의 메시지를 그대로 출력합니다. `platform.yaml`의 env와 이름이 같으면 시크릿이 이깁니다.
+- 값은 명령줄 인자로 받지 않습니다. 셸 히스토리에 남기 때문입니다. `set`은 기본으로 터미널에서 값을 묻고, 입력한 내용을 화면에 보여 주지 않습니다. 터미널이 아니면 다음 중 하나를 줘야 합니다.
+  - `--stdin`: 표준 입력의 한 줄을 읽습니다. 끝의 줄바꿈(`\n`이나 `\r\n`)만 떼고 앞뒤 공백은 그대로 둡니다. 두 줄 이상이면 거부합니다. 예: `printf '%s\n' "$ADMIN_TOKEN" | charlie app secret set moimroom ADMIN_TOKEN --stdin`
+  - `--from-file FILE`: 파일 내용을 그대로 쓰고 끝의 줄바꿈 하나만 뗍니다. 인증서처럼 여러 줄인 값에 씁니다. 줄바꿈을 뗀 내용이 4096바이트를 넘으면 거부합니다.
+  - `--env-file FILE`: `NAME=value` 줄마다 시크릿 하나를 넣고, 요청은 PUT 한 번입니다. 빈 줄과 `#`으로 시작하는 줄은 건너뜁니다. 값은 첫 `=` 뒤 전부이고 따옴표를 벗기지 않습니다(`docker run --env-file`과 같다). 줄 끝의 `\r`은 뗍니다. 잘못된 줄이 있으면 아무것도 보내지 않고, 잘못된 줄을 모두 줄 번호와 이유로 출력합니다. 이때 값은 출력하지 않습니다.
+- `get`은 값만 한 줄로 출력하므로 `VALUE=$(charlie app secret get moimroom HOST_CODE)`처럼 쓸 수 있습니다. 표준 출력이 터미널이면 값이 화면에 보인다는 경고 한 줄을 표준 오류에 씁니다. `--instance`를 주면 그 인스턴스의 덮어쓰기만 읽고, 덮어쓰기가 없으면 404 `secret_not_found`와 함께 `--instance` 없이 앱 단위 값을 읽으라고 알려 줍니다. 서버는 값을 읽을 때마다 감사 로그에 이름을 남깁니다.
+- `list`는 이름과 바꾼 시각, 바꾼 사람만 보여 주고 값은 보여 주지 않습니다. viewer 역할도 쓸 수 있습니다. `--instance`를 주면 그 인스턴스가 받는 시크릿을 SOURCE와 함께 보여 줍니다. `app`은 앱 단위 값, `override`는 앱 단위 값을 덮어쓴 인스턴스 값, `instance-only`는 그 인스턴스에만 있는 값입니다.
+- `rm`은 이름 여러 개를 PUT 한 번으로 지웁니다. 지운 값은 되돌릴 수 없으므로 터미널에서는 `yes`를 입력해야 지우고, 터미널이 아니면 `--yes`가 있어야 합니다. 설정되지 않은 이름은 표준 오류에 알리고 건너뛰며, 지울 것이 하나도 없으면 오류로 끝납니다.
+- 실행 중인 인스턴스는 다시 배포할 때까지 예전 값을 씁니다. `set`과 `rm`은 바뀐 값을 받는 인스턴스마다 재배포 명령을 출력합니다. 앱 단위 시크릿을 바꿀 때 그 이름을 모두 덮어쓴 인스턴스는 빠집니다.
+
+  ```
+  Set HOST_CODE app-wide in app moimroom.
+  Running instances keep the old values until they are deployed again; to apply the change now, without a build:
+    charlie deploy moimroom --redeploy
+  ```
+
+- `deploy --redeploy`는 빌드와 GitHub 읽기 없이 그 인스턴스의 마지막 healthy 배포를 같은 커밋, 같은 이미지로 다시 배포하고, 이때 지금의 시크릿을 넣습니다. 트리거는 `redeploy`이고 `deploy list`, `deploy show`, `deploy watch`에 그대로 보입니다. `--ref`와 함께 쓰면 사용법 오류(종료 코드 2)입니다. healthy 배포가 없으면 409 `nothing_to_redeploy`, 끝나지 않은 배포가 있으면 409 `deployment_in_progress`로 끝나고, 각각 빌드하는 배포 명령과 `deploy list` 명령을 알려 줍니다.
+- 서버에 시크릿 키(`PLATFORM_SECRETS_KEY`)가 없으면 모든 시크릿 명령이 503 `secrets_not_configured`로 끝납니다.
+- `--json`이면 `list`, `set`, `rm`은 API 응답(이름만 있다)을 출력하고, 재배포 안내는 표준 오류로 보냅니다. `list --instance --json`은 `{"instance", "secrets": [{"name", "source", "updatedAt", "updatedBy"}]}`입니다. 출력에 값이 나오는 명령은 `get`뿐입니다.
 
 ## 종료 코드
 
