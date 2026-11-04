@@ -105,7 +105,7 @@ charlie login             # 남은 코드로 승인 여부를 확인하고 토�
 `migrate start` 옵션은 다음과 같습니다.
 
 - `--auto-switch`: 데이터가 따라잡히면 승인을 기다리지 않고 바로 전환합니다.
-- `--canary 10,50 --canary-step 20s`: 전환 전에 읽기 요청을 대상으로 10%, 50% 순서로 보내고 게이트를 판정합니다.
+- `--canary 1,10,25,50,75,90,100 --canary-step 10s`: 전환 전에 읽기 요청을 대상으로 이 순서로 보내고 단계마다 게이트를 판정합니다. 콘솔 기본값과 같은 권장 단계입니다. 요청이 `--min-requests`보다 적은 단계는 `[..] inconclusive`로 표시되고 다음 단계로 넘어가며, 마지막 단계는 충분한 요청으로 통과해야 합니다.
 - `--observe 2m --observe-step 20s`: 전환이 끝난 뒤에도 정한 시간 동안 대상을 게이트로 계속 판정하고 나서 run을 끝냅니다. 게이트를 어긴 단계가 나오면 관찰을 멈추고, run은 `succeeded`로 끝나되 위반 내용을 남깁니다. 게이트웨이 http 모드 Plan에서만 쓸 수 있습니다.
 - `--auto-rollback`: `--observe`와 함께 쓰면, 게이트를 어겼을 때 서버가 바로 롤백 run을 시작합니다(행위자 `slo-guard`). 없으면 운영자가 `charlie migrate rollback`으로 정합니다.
 - `--max-error-rate`, `--max-p95`, `--min-requests`: 게이트 기준을 바꿉니다. 카나리와 observe에 같은 기준이 쓰이고, `--canary`나 `--observe`가 있어야 합니다. 지정하지 않으면 서버 기본값을 씁니다.
@@ -119,7 +119,7 @@ charlie login             # 남은 코드로 승인 여부를 확인하고 토�
 charlie plan submit -f plan.json                  # agent 또는 operator
 charlie plan show pln_xxx                         # revision과 첨부 확인
 charlie plan approve pln_xxx --revision 2 --comment "확인함"    # operator
-charlie migrate start pln_xxx --canary 10,50 --watch
+charlie migrate start pln_xxx --canary 1,10,25,50,75,90,100 --watch
 # 다른 터미널에서, awaiting_switch가 되면
 charlie migrate switch <run id>
 ```
