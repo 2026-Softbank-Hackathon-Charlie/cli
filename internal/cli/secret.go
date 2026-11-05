@@ -171,7 +171,8 @@ after the first "=", quotes included. A bad line stops it with its line
 number before anything is sent.
 
 Names match ^[A-Z_][A-Z0-9_]*$, have at most 64 characters, and are not PORT,
-DATABASE_URL or S3_*, which the platform sets. Values are 1 to 4096 bytes of
+DATABASE_URL, PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD,
+JDBC_DATABASE_URL or S3_*, which the platform sets. Values are 1 to 4096 bytes of
 UTF-8 text without NUL bytes; a UTF-8 byte order mark at the start is dropped
 and UTF-16 is refused. One change sets at most 50 names. A secret wins over a
 platform.yaml env entry of the same name. Running instances keep the old
@@ -211,7 +212,7 @@ values until they are deployed again; charlie prints the "charlie deploy
 				if strings.Contains(args[1], "=") {
 					return usagef(cmd, "NAME has no \"=\": %s", noValueArg)
 				}
-				if err := checkSecretName(args[1]); err != nil {
+				if err := checkNewSecretName(args[1]); err != nil {
 					return usagef(cmd, "%v", err)
 				}
 			}
@@ -403,8 +404,10 @@ func (g *globals) appInstance(cmd *cobra.Command, c *client.Client, app, arg str
 	return a, in, err
 }
 
-// checkSecretName returns why name cannot be a secret's name, as the server
-// would. A name with "=" is not printed: the rest may be a value.
+// checkSecretName returns why name cannot be a stored secret's name, as the
+// server would. A name with "=" is not printed: the rest may be a value. A
+// name the platform reserved after the secret was stored (platform ADR 0024)
+// passes, so get and rm still reach it.
 func checkSecretName(name string) error {
 	switch {
 	case strings.Contains(name, "="):
@@ -413,8 +416,18 @@ func checkSecretName(name string) error {
 		return fmt.Errorf("secret name %.20q... is longer than %d characters", name, maxSecretName)
 	case !secretNamePattern.MatchString(name):
 		return fmt.Errorf("secret name %q must match ^[A-Z_][A-Z0-9_]*$", name)
-	case appspec.Reserved(name):
-		return fmt.Errorf("secret name %s is set by the platform (PORT, DATABASE_URL and S3_* are reserved)", name)
+	}
+	return nil
+}
+
+// checkNewSecretName is checkSecretName for a secret being set: it also
+// refuses the names the platform sets.
+func checkNewSecretName(name string) error {
+	if err := checkSecretName(name); err != nil {
+		return err
+	}
+	if appspec.Reserved(name) {
+		return fmt.Errorf("secret name %s is set by the platform (%s are reserved)", name, appspec.ReservedNames)
 	}
 	return nil
 }
@@ -562,7 +575,7 @@ func parseEnvFile(file string, data []byte) (map[string]string, error) {
 			bad = append(bad, fmt.Sprintf("line %d: the name is longer than %d characters", n, maxSecretName))
 			continue
 		case appspec.Reserved(name):
-			bad = append(bad, fmt.Sprintf("line %d: %v", n, checkSecretName(name)))
+			bad = append(bad, fmt.Sprintf("line %d: %v", n, checkNewSecretName(name)))
 			continue
 		}
 		if prev, dup := seen[name]; dup {

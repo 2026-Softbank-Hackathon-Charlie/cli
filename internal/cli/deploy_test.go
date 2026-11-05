@@ -849,6 +849,12 @@ func TestAppValidateLocal(t *testing.T) {
 	aligned(t, r.stdout, "HEALTH CHECK", "web", "/healthz")
 	aligned(t, r.stdout, "DOCKERFILE", "web", "Dockerfile")
 
+	// A worker has no port (platform ADR 0024): its PORT shows as -.
+	worker := write("worker.yaml", strings.Replace(validSpec, "resources:", "  - name: jobs\n    memory: 512Mi\n    cpu: 250m\nresources:", 1))
+	r = h.run("", "app", "validate", "-f", worker).ok(t)
+	aligned(t, r.stdout, "PORT", "web", "8080")
+	aligned(t, r.stdout, "PORT", "jobs", "-")
+
 	bad := write("bad.yaml", `name: Moimroom
 services:
   - name: web
@@ -861,8 +867,8 @@ services:
 `)
 	want := bad + ` is invalid (4 errors):
   name: must be 3 to 32 lowercase letters, digits and hyphens, starting and ending with a letter or digit
-  services[0].port: is required
-  services[0].env.PORT: is set by the platform (PORT, DATABASE_URL and S3_* are reserved)
+  services[0].public: needs a port: the traffic gateway sends requests to it
+  services[0].env.PORT: is set by the platform (PORT, DATABASE_URL, PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, JDBC_DATABASE_URL and S3_* are reserved)
   services[1].public: only one service may be public; services[0] is
 `
 	if r := h.run("", "app", "validate", "-f", bad); r.code != ExitError || r.stdout != want || r.stderr != "" {
@@ -876,7 +882,7 @@ services:
 
 	r = h.run("", "--json", "app", "validate", "-f", bad)
 	v := decodeOut[apiv1.AppSpecValidation](t, r.stdout)
-	if r.code != ExitError || v.Valid || len(v.Errors) != 4 || v.Errors[1] != (apiv1.AppSpecFieldError{Path: "services[0].port", Message: "is required"}) || v.Spec == nil || v.Spec.Name != "Moimroom" {
+	if r.code != ExitError || v.Valid || len(v.Errors) != 4 || v.Errors[1] != (apiv1.AppSpecFieldError{Path: "services[0].public", Message: "needs a port: the traffic gateway sends requests to it"}) || v.Spec == nil || v.Spec.Name != "Moimroom" {
 		t.Errorf("--json invalid: exit %d %+v", r.code, v)
 	}
 	r = h.run(validSpec, "--json", "app", "validate", "-f", "-").ok(t)

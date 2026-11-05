@@ -634,10 +634,10 @@ func TestAppSecretSetEnvFile(t *testing.T) {
 	want := "error: " + bad + ": nothing was set:\n" +
 		"  line 2: want NAME=value\n" +
 		"  line 3: " + notName + "\n" +
-		"  line 4: secret name PORT is set by the platform (PORT, DATABASE_URL and S3_* are reserved)\n" +
+		"  line 4: secret name PORT is set by the platform (PORT, DATABASE_URL, PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, JDBC_DATABASE_URL and S3_* are reserved)\n" +
 		"  line 5: GOOD is already set on line 1\n" +
 		"  line 6: the value of EMPTY is empty\n" +
-		"  line 7: secret name S3_BUCKET is set by the platform (PORT, DATABASE_URL and S3_* are reserved)\n" +
+		"  line 7: secret name S3_BUCKET is set by the platform (PORT, DATABASE_URL, PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, JDBC_DATABASE_URL and S3_* are reserved)\n" +
 		"  line 8: " + notName + "\n" +
 		"  line 9: " + notName + "\n" +
 		"  line 10: " + notName + "\n" +
@@ -759,6 +759,16 @@ func TestAppSecretRm(t *testing.T) {
 		t.Errorf("stdout:\n%s\nwant:\n%s", r.stdout, want)
 	}
 	noValues(t, "rm", r, "k-app-value", "k-default-value", "k-dev-value")
+
+	// A secret stored before the platform reserved its name (platform ADR
+	// 0024) can still be deleted.
+	f.mu.Lock()
+	f.secrets = map[string]map[string]fakeSecret{"": {"PGHOST": {value: "old-host"}}}
+	f.mu.Unlock()
+	r = h.run("", "app", "secret", "rm", "moimroom", "PGHOST", "--yes").ok(t)
+	if body := string(f.last(t, "PUT", "/v1/apps/moimroom/secrets").body); body != `{"delete":["PGHOST"]}` {
+		t.Errorf("body %s", body)
+	}
 }
 
 // Names are checked as the server would, before anything is sent.
@@ -777,9 +787,9 @@ func TestAppSecretValidation(t *testing.T) {
 		{[]string{"get", "moimroom", "host_code"}, `secret name "host_code" must match ^[A-Z_][A-Z0-9_]*$`},
 		{[]string{"get", "moimroom", "1ABC"}, `secret name "1ABC" must match ^[A-Z_][A-Z0-9_]*$`},
 		{[]string{"get", "moimroom", strings.Repeat("A", 65)}, `secret name "AAAAAAAAAAAAAAAAAAAA"... is longer than 64 characters`},
-		{[]string{"set", "moimroom", "PORT", "--stdin"}, "secret name PORT is set by the platform (PORT, DATABASE_URL and S3_* are reserved)"},
+		{[]string{"set", "moimroom", "PORT", "--stdin"}, "secret name PORT is set by the platform (PORT, DATABASE_URL, PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD, JDBC_DATABASE_URL and S3_* are reserved)"},
 		{[]string{"set", "moimroom", "DATABASE_URL", "--stdin"}, "secret name DATABASE_URL is set by the platform"},
-		{[]string{"rm", "moimroom", "S3_ACCESS_KEY", "--yes"}, "secret name S3_ACCESS_KEY is set by the platform"},
+		{[]string{"set", "moimroom", "PGHOST", "--stdin"}, "secret name PGHOST is set by the platform"},
 		{[]string{"rm", "moimroom", "A", "B", "A", "--yes"}, "A is given twice"},
 		{append([]string{"rm", "moimroom", "--yes"}, names...), "51 names; one change deletes at most 50"},
 		{[]string{"rm", "moimroom"}, "charlie app secret rm needs APP NAME..."},
