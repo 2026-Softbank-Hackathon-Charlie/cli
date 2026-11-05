@@ -317,7 +317,11 @@ func specTable(s *apiv1.AppSpec) string {
 				env = append(env, k+"="+(*sv.Env)[k])
 			}
 		}
-		rows = append(rows, []string{sv.Name, fmt.Sprint(sv.Port), yesNo(sv.Public), fmt.Sprint(sv.Replicas),
+		port := "-" // a worker listens on no port (platform ADR 0024)
+		if sv.Port != 0 {
+			port = fmt.Sprint(sv.Port)
+		}
+		rows = append(rows, []string{sv.Name, port, yesNo(sv.Public), fmt.Sprint(sv.Replicas),
 			path.Join(sv.Path, sv.Dockerfile), str(sv.HealthCheck), clip(strings.Join(env, ", "), 60)})
 	}
 	return table(rows)
