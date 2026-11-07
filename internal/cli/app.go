@@ -222,7 +222,7 @@ directory of the saved login and the update files.`,
 		g.loginCmd(), g.logoutCmd(), g.whoamiCmd(),
 		g.envCmd(), g.planCmd(), g.migrateCmd(),
 		g.trafficCmd(), g.matrixCmd(), g.auditCmd(), g.versionCmd(), g.updateCmd(),
-		g.securityCmd(), g.agentCmd(), g.appCmd(), g.deployCmd(),
+		g.securityCmd(), g.agentCmd(), g.appCmd(), g.deployCmd(), g.onboardCmd(),
 	)
 	g.addPlanTools(root)
 	return root

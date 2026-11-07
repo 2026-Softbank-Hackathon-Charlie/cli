@@ -245,6 +245,28 @@ charlie app secret rm moimroom HOST_CODE --instance dev   # 덮어쓰기를 지�
 - 서버에 시크릿 키(`PLATFORM_SECRETS_KEY`)가 없으면 모든 시크릿 명령이 503 `secrets_not_configured`로 끝납니다.
 - `--json`이면 `list`, `set`, `rm`은 API 응답(이름만 있다)을 출력하고, 재배포 안내는 표준 오류로 보냅니다. `list --instance --json`은 `{"instance", "secrets": [{"name", "source", "updatedAt", "updatedBy"}]}`입니다. 출력에 값이 나오는 명령은 `get`뿐입니다.
 
+## 기존 compose 앱 가져오기
+
+플랫폼 밖 VM 한 대에서 docker compose로 돌던 앱을 조사하고, 계약 PR과 DB 물리 복제로 무중단 가져옵니다(platform 레포 `docs/adr/0042-onboard-existing-compose-apps.md`). 콘솔의 "기존 앱 가져오기"와 같은 API를 씁니다. 서버는 `PLATFORM_ONBOARDING=1`일 때만 이 경로가 있고, 구현 중에는 `not_implemented`(501)로 답합니다.
+
+```bash
+charlie onboard start --repo OWNER/NAME --url https://LABEL.hopcharlie.dev [--env eks] [--follow]
+charlie onboard list
+charlie onboard status ID [--follow]   # 상태, Facts 요약, 차단 사유와 경고, PR, 시험 결과, 사람이 할 일, 다음 명령
+charlie onboard approve ID [--yes]     # awaiting_approval에서. 보여 준 PR head 커밋으로 승인한다
+charlie onboard resume ID              # failed이거나 GitHub App 설치, DNS 레코드 삭제를 기다릴 때 다시 확인한다
+charlie onboard cutover ID             # ready에서. 전환 run을 시작하고 run id를 출력한다
+charlie onboard decommission ID [--yes]
+charlie onboard delete ID [--yes]
+```
+
+- 상태는 `discovering`, `patching`, `checking`, `awaiting_approval`, `connecting`, `registering`, `syncing`, `ready`, `cutting_over`, `decommissioning`, `done`이고 실패하면 `failed (in 상태)`로 표시합니다. `status`는 상태마다 다음에 보낼 명령을 마지막 줄에 출력합니다.
+- `approve`는 온보딩을 먼저 읽어 차단 사유와 경고, PR 번호와 head 커밋, 시험 배포의 시작 시간과 보류 예산, 원본에 더할 변경 목록(hba 줄 같은 정확한 값 포함), 원본 배포 workflow가 꺼진다는 안내를 출력하고, 앱 이름을 입력하면 그 head 커밋으로 승인합니다. 그 사이 PR이 바뀌었거나 기본 브랜치보다 뒤처졌으면 서버가 `pr_head_mismatch`로 거부하고 브랜치를 다시 만들어 시험합니다. `status`로 다시 보고 다시 승인합니다. `--json`이면 이 안내는 표준 오류로 나갑니다.
+- 승인한 뒤부터는 원본 배포 workflow가 꺼져 있으므로 `status`가 그 사실을 계속 보여 줍니다.
+- `cutover`가 시작한 run은 `charlie migrate watch RUNID`로 봅니다. 승격 뒤 halt로 멈추면 `charlie migrate resume RUNID`로 이어 갑니다.
+- `delete`는 상태에 따라 다른 확인 문구를 보여 줍니다. `awaiting_approval`까지는 PR을 닫고, `connecting`부터 `ready`까지는 원본에 한 일을 반대 순서로 되돌리고 등록한 앱을 지웁니다. `cutting_over`부터는 서버가 거부합니다.
+- `status --follow`는 단계 기록을 한 줄씩 출력하고 `done`이 되거나 삭제되면 끝납니다. `failed`는 `resume`으로 이어지므로 계속 따라갑니다. `--json`이면 메시지마다 `{"event", "id", "data"}` 한 줄입니다.
+
 ## 종료 코드
 
 | 코드 | 뜻 |
