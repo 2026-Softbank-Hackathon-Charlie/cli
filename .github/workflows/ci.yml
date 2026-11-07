@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   go:
-    runs-on: [self-hosted, hopcharlie]
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       GOPRIVATE: github.com/2026-Softbank-Hackathon-Charlie
