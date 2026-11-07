@@ -137,11 +137,13 @@ charlie migrate switch <run id>
 | `app repos` | 플랫폼의 GitHub App이 볼 수 있는 레포 |
 | `app add --repo OWNER/NAME --env ENV [--env ENV...] [--branch main] [--no-auto-deploy] [--watch]` | 레포를 앱으로 등록하고 첫 배포를 큐에 넣는다 (operator). 앱 이름은 `platform.yaml`의 `name`이다. `--branch`는 앱의 기본 브랜치이고, 이 브랜치가 앱 이름의 기본 인스턴스가 된다. `--no-auto-deploy`가 없으면 브랜치에 push 할 때마다 다시 배포한다 |
 | `app list` | GitHub에서 등록한 앱의 인스턴스 수, 레포, 기본 브랜치, 환경별 상태, 커밋, URL과, 앱 파일의 앱 |
-| `app show NAME` | 앱 상세, `platform.yaml` 요약(서비스, 포트, 리소스), 환경별 Argo CD 상태, 인스턴스 목록, 최근 배포 5개 |
+| `app show NAME` | 앱 상세, `platform.yaml` 요약(서비스, 포트, 리소스), 환경별 Argo CD 상태, DB 짝(있을 때), 인스턴스 목록, 최근 배포 5개 |
 | `app rm NAME [--yes]` | 등록을 지운다 (operator). gitops 레포에서 `apps/NAME/`과 추가한 인스턴스마다 `apps/<instance>/`를 지우고, Argo CD가 모든 환경에서 모든 인스턴스의 워크로드와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 앱 이름을 입력해야 지운다 |
 | `app branch add APP BRANCH [--no-auto-deploy] [--watch]` | 앱 레포의 다른 브랜치를 인스턴스 하나로 더 띄우고 첫 배포를 큐에 넣는다 (operator). 인스턴스 이름과 URL을 출력한다. `--no-auto-deploy`가 없으면 그 브랜치에 push 할 때마다 그 인스턴스에 다시 배포한다 |
 | `app branch list APP` | 앱의 인스턴스 목록: 인스턴스 이름, 브랜치, 기본 인스턴스인지, 자동 배포, 환경별 상태, 커밋, URL |
 | `app branch rm APP INSTANCE\|BRANCH [--yes]` | 추가한 인스턴스를 지운다 (operator). 인스턴스 이름이나 브랜치로 가리킨다. Argo CD가 그 인스턴스의 네임스페이스와 DB, 버킷을 지우므로 데이터는 되돌릴 수 없다. `--yes`가 없으면 인스턴스 이름을 입력해야 지운다. 기본 인스턴스는 `app rm`으로 앱과 함께만 지운다 |
+| `app env add APP ENV [--watch]` | 등록한 앱에 환경을 더하고, 기본 인스턴스의 마지막 healthy 배포를 빌드 없이 새 환경을 포함한 모든 환경에 다시 배포한다 (operator). 배포 ID를 출력한다. 아래 "앱에 환경 더하고 빼기" |
+| `app env remove APP ENV [--yes] [--watch]` | 앱에서 환경을 뺀다 (operator). Argo CD가 그 환경에 있는 모든 인스턴스의 네임스페이스와 DB 사본, 파일(버킷)을 지우므로 그 환경의 데이터는 되돌릴 수 없다. `--yes`가 없으면 환경 이름을 입력해야 뺀다 |
 | `app secret list APP [--instance INSTANCE\|BRANCH]` | 시크릿 이름과 바꾼 시각, 바꾼 사람. 값은 보여 주지 않는다. `--instance`면 그 인스턴스가 받는 시크릿과 출처(SOURCE). 아래 "시크릿" |
 | `app secret get APP NAME [--instance INSTANCE\|BRANCH]` | 시크릿 값 하나만 출력한다 (operator) |
 | `app secret set APP NAME [--instance INSTANCE\|BRANCH] [--stdin \| --from-file FILE]` | 시크릿 하나를 넣거나 바꾼다 (operator). 값은 기본으로 화면에 보이지 않는 프롬프트로 받는다 |
@@ -181,6 +183,28 @@ charlie app branch add moimroom dev --watch            # dev 브랜치를 moimro
 charlie deploy moimroom --branch dev --ref 9fceb02     # moimroom--dev에 특정 커밋을 배포
 charlie app branch rm moimroom dev
 ```
+
+### 앱에 환경 더하고 빼기
+
+한 환경에 등록한 앱을 나중에 다른 환경에도 띄울 때 씁니다(platform 레포 `docs/adr/0037-add-environment-to-registered-app.md`).
+
+```bash
+charlie app env add moimroom eks --watch      # eks를 더하고 모든 환경으로 가는 배포를 지켜본다
+charlie app show moimroom                     # Database pair에서 이전할 준비가 됐는지 본다
+charlie app env remove moimroom eks           # 환경 이름을 입력해야 뺀다
+```
+
+- `app env add`는 빌드하지 않습니다. 기본 인스턴스의 마지막 healthy 배포(같은 커밋, 같은 이미지, 같은 `platform.yaml`)를 지금의 시크릿으로 모든 환경에 다시 배포하고, 트리거는 `environment`입니다. 추가한 인스턴스는 다음 배포 때 새 환경으로 갑니다. 배포가 실패했으면 같은 명령을 다시 보내 새 배포를 큐에 넣습니다.
+- postgres 리소스가 있는 앱은 그 환경을 peer로 하는 DB 짝이 있어야 더할 수 있습니다. 새 환경의 DB는 앱 DB의 streaming replica가 되고, `app show`의 Database pair에서 `Ready to migrate`가 yes가 되면 `migrate`로 옮길 수 있습니다. `Readiness`는 준비되지 않은 이유이고, 아래 표는 두 환경마다 앱의 환경인지, 배포가 healthy로 끝났는지, 게이트웨이 백엔드가 있는지, CNPG Cluster의 역할과 상태입니다. `Replica in app`이 no이면 replica 환경이 아직 앱의 환경이 아니라는 뜻이고, 더할 명령을 함께 보여 줍니다.
+- `app env remove`는 앱의 첫 환경(DB가 primary로 태어난 곳)과 쓰기 백엔드였던 환경은 뺄 수 없습니다. DB 짝은 남으므로 다시 더할 수 있습니다. 남은 환경으로 가는 배포가 큐에 들어가면 그 배포 ID를 출력하고, 다시 배포할 healthy 배포가 없으면 배포 없이 끝납니다. 이때 `--watch`는 지켜볼 것이 없어 바로 끝납니다.
+- 서버가 거부하면 다른 명령처럼 `error: 코드: 메시지 (HTTP 상태)`를 출력하고, `environment_exists`, `env_not_found`, `deployment_in_progress`, `migration_in_progress`, `nothing_to_redeploy`, `db_pair_unavailable`, `primary_environment`, `write_backend`에는 다음에 할 일을 한 줄 덧붙입니다.
+
+  ```
+  error: db_pair_unavailable: app moimroom has no database pair with peer aks (HTTP 409)
+  The app's database has no pair with aks as the peer, so its database there could never be migrated to; the pair is made when the app is registered.
+  ```
+
+- `--json`이면 `app env add`는 `{"app", "deployment"}`, `app env remove`는 `{"app", "deployment"?}`(배포가 없으면 `deployment`가 없다)를 출력하고, `--watch`와 함께면 그 응답 한 줄 뒤에 배포 이벤트를 한 줄씩 출력합니다.
 
 ### 시크릿
 

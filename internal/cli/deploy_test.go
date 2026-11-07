@@ -43,6 +43,8 @@ type deployFake struct {
 	// App secrets of moimroom, by instance ("" app-wide) and name; nil
 	// answers 503 secrets_not_configured. See secretRoutes.
 	secrets map[string]map[string]fakeSecret
+	// topology is moimroom's database pair; nil leaves it out.
+	topology *apiv1.AppDBTopology
 }
 
 // registeredApp is moimroom as the server lists it now: the fixture and the
@@ -52,6 +54,7 @@ func (f *deployFake) registeredApp() apiv1.App {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	a.Deploy.Instances = append(a.Deploy.Instances, f.added...)
+	a.Deploy.DbTopology = f.topology
 	return a
 }
 
@@ -227,7 +230,7 @@ func newDeployFake(t *testing.T) *deployFake {
 		n, script := f.conns, f.events
 		f.conns++
 		f.mu.Unlock()
-		if id := r.PathValue("id"); script == nil || (id != "dep_1" && id != "dep_2" && id != "dep_4") {
+		if id := r.PathValue("id"); script == nil || (id != "dep_1" && id != "dep_2" && id != "dep_4" && id != "dep_5") {
 			writeError(w, 404, "deployment_not_found", "deployment not found")
 			return
 		}
@@ -235,6 +238,7 @@ func newDeployFake(t *testing.T) *deployFake {
 		script(w, r, n)
 	})
 	f.secretRoutes(mux)
+	f.envRoutes(mux)
 	mux.HandleFunc("GET /v1/github/repos", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, apiv1.GitHubRepoList{Repos: []apiv1.GitHubRepo{
 			{FullName: "org/moimroom", Private: true, DefaultBranch: "main", HtmlUrl: "https://github.com/org/moimroom"},

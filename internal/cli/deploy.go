@@ -25,7 +25,7 @@ const appShowDeployments = 5
 
 func (g *globals) appCmd() *cobra.Command {
 	return group("app", "Register apps from GitHub, see how they run and check platform.yaml",
-		g.appAddCmd(), g.appListCmd(), g.appShowCmd(), g.appRmCmd(), g.appBranchCmd(), g.appSecretCmd(), g.appValidateCmd(), g.appReposCmd())
+		g.appAddCmd(), g.appListCmd(), g.appShowCmd(), g.appRmCmd(), g.appBranchCmd(), g.appEnvCmd(), g.appSecretCmd(), g.appValidateCmd(), g.appReposCmd())
 }
 
 func (g *globals) appAddCmd() *cobra.Command {
@@ -271,6 +271,7 @@ func renderAppDetail(d *appDetail, now time.Time) string {
 				shortSHA(str(st.Commit)), str(st.Url), stampPtr(st.UpdatedAt)})
 		}
 		out += "\n" + table(rows)
+		out += dbTopologyText(a.Name, dep.DbTopology)
 		if len(dep.Instances) > 0 {
 			out += "\nInstances\n" + instanceTable(dep)
 		}
