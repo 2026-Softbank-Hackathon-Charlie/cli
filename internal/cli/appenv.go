@@ -186,6 +186,10 @@ func appEnvError(err error, app, env string) error {
 		hint = env + " is or was the app's write backend; migrate the app away first."
 	case "db_topology_unready":
 		hint = "The two databases that would remain must be one healthy primary and a replica streaming from it; see them with: charlie app show " + app
+	case "db_topology_changed":
+		hint = "Nothing was removed; the primary database changed while the server checked it. Try again."
+	case "db_topology_denied":
+		hint = "Nothing was removed; the workload cluster refused the change of the primary database. Check its access policy (infra ADR 0078)."
 	case "db_topology_unknown", "db_topology_unreachable":
 		hint = "Nothing was removed; the server could not read or change a database Cluster of the app. Try again."
 	default:
