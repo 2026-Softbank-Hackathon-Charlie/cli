@@ -184,6 +184,10 @@ func appEnvError(err error, app, env string) error {
 		hint = "The app's first environment, where its database was born primary, stays; remove the app with: charlie app rm " + app
 	case "write_backend":
 		hint = env + " is or was the app's write backend; migrate the app away first."
+	case "db_topology_unready":
+		hint = "The two databases that would remain must be one healthy primary and a replica streaming from it; see them with: charlie app show " + app
+	case "db_topology_unknown", "db_topology_unreachable":
+		hint = "Nothing was removed; the server could not read or change a database Cluster of the app. Try again."
 	default:
 		return err
 	}

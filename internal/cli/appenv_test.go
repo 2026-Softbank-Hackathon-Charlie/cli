@@ -55,6 +55,8 @@ func (f *deployFake) envRoutes(mux *http.ServeMux) {
 			writeJSON(w, 202, apiv1.AppEnvironmentRemoved{App: a, Deployment: envDeployment("gke")})
 		case env == "onprem":
 			writeJSON(w, 202, apiv1.AppEnvironmentRemoved{App: f.registeredApp()})
+		case env == "aks":
+			writeError(w, 409, "db_topology_unready", "the database in eks follows shop-db-aks through shop-db-aks, not the primary shop-db-gke directly; nothing was changed")
 		default:
 			writeError(w, 404, "env_not_found", "app moimroom is not in environment "+env)
 		}
@@ -175,6 +177,10 @@ func TestAppEnvRemove(t *testing.T) {
 		r.stderr != "error: primary_environment: gke is the first environment of app moimroom (HTTP 409)\n"+
 			"The app's first environment, where its database was born primary, stays; remove the app with: charlie app rm moimroom\n" {
 		t.Errorf("primary: exit %d, stderr %q", r.code, r.stderr)
+	}
+	if r := h.run("", "app", "env", "remove", "moimroom", "aks", "--yes"); r.code != ExitError ||
+		!strings.HasSuffix(r.stderr, "(HTTP 409)\nThe two databases that would remain must be one healthy primary and a replica streaming from it; see them with: charlie app show moimroom\n") {
+		t.Errorf("database group topology: exit %d, stderr %q", r.code, r.stderr)
 	}
 	if r := h.run("", "app", "env", "remove", "shop", "eks"); r.code != ExitError || !strings.Contains(r.stderr, "app shop is only in the server's apps file") {
 		t.Errorf("file app: exit %d, stderr %q", r.code, r.stderr)
